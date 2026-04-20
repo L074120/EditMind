@@ -137,7 +137,7 @@ async function processarArquivos(arquivos) {
     });
 
     const dados = new FormData();
-    dados.append('arquivo', arquivo);
+    dados.append('file', arquivo);
 
     try {
         const resposta = await fetch(`${API_BASE_URL}/api/upload`, {
