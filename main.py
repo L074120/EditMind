@@ -1,3 +1,5 @@
+# main.py
+
 ```python
 import os
 import json
@@ -18,7 +20,6 @@ load_dotenv()
 
 app = FastAPI(title="EditMind Pro API")
 
-# CORS liberado para front-end no Vercel
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,20 +28,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pasta de saída dos vídeos cortados
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
-# Clientes globais
 GROQ_CLIENT = Groq(api_key=os.getenv("GROQ_API_KEY"))
 OPENAI_CLIENT = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-
-# ----------------------------
-# FUNÇÕES AUXILIARES
-# ----------------------------
 
 def segundos_para_timestamp(segundos: float) -> str:
     horas = int(segundos // 3600)
@@ -63,10 +58,9 @@ def obter_metadados_video(caminho_video: str):
     resultado = subprocess.run(cmd, capture_output=True, text=True)
 
     if resultado.returncode != 0:
-        raise Exception("Erro ao obter metadados com ffprobe")
+        raise Exception("Erro ao obter metadados do vídeo")
 
     dados = json.loads(resultado.stdout)
-
     stream = dados["streams"][0]
     duracao = float(dados["format"]["duration"])
 
@@ -121,10 +115,7 @@ def analisar_viralidade(segmentos):
         inicio = round(segmento["start"], 2)
         fim = round(segmento["end"], 2)
         texto = segmento["text"].strip()
-
-        segmentos_formatados.append(
-            f"[{inicio}s - {fim}s] {texto}"
-        )
+        segmentos_formatados.append(f"[{inicio}s - {fim}s] {texto}")
 
     transcricao_formatada = "\n".join(segmentos_formatados)
 
@@ -138,12 +129,12 @@ Regras:
 - Priorize partes com emoção, curiosidade, punchline, revelação, humor, polêmica ou frase forte
 - Nunca escolha começo vazio ou final cortado
 - Responda SOMENTE JSON válido
-- O JSON deve ter exatamente esta estrutura:
 
+Formato:
 {{
   "inicio": 12.5,
   "fim": 42.8,
-  "motivo": "Explicação curta do porquê esse trecho tem potencial viral"
+  "motivo": "Explicação curta"
 }}
 
 Transcrição:
@@ -166,8 +157,7 @@ Transcrição:
         temperature=0.4
     )
 
-    conteudo = resposta.choices[0].message.content
-    return json.loads(conteudo)
+    return json.loads(resposta.choices[0].message.content)
 
 
 def cortar_video(entrada: str, saida: str, inicio: float, fim: float):
@@ -190,10 +180,6 @@ def cortar_video(entrada: str, saida: str, inicio: float, fim: float):
     if resultado.returncode != 0:
         raise Exception(f"Erro ao cortar vídeo: {resultado.stderr}")
 
-
-# ----------------------------
-# ENDPOINTS
-# ----------------------------
 
 @app.get("/")
 def home():
@@ -279,3 +265,40 @@ async def upload_video(
         shutil.rmtree(pasta_temp, ignore_errors=True)
         raise HTTPException(status_code=500, detail=str(e))
 ```
+
+---
+
+# app.js
+
+Troca só este trecho:
+
+```js
+const dados = new FormData();
+dados.append('file', arquivo);
+
+const resposta = await fetch(`${API_BASE_URL}/api/upload`, {
+    method: 'POST',
+    headers: HEADERS_PADRAO,
+    body: dados,
+});
+```
+
+No teu código atual, substitui:
+
+```js
+dados.append('arquivo', arquivo);
+```
+
+por:
+
+```js
+dados.append('file', arquivo);
+```
+
+E garante que continua usando:
+
+```js
+fetch(`${API_BASE_URL}/api/upload`)
+```
+
+porque o main novo usa `/api/upload`.
