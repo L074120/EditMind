@@ -1,6 +1,3 @@
-# main.py
-
-```python
 import os
 import json
 import uuid
@@ -36,13 +33,11 @@ app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 GROQ_CLIENT = Groq(api_key=os.getenv("GROQ_API_KEY"))
 OPENAI_CLIENT = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-
 def segundos_para_timestamp(segundos: float) -> str:
     horas = int(segundos // 3600)
     minutos = int((segundos % 3600) // 60)
     segundos_restantes = int(segundos % 60)
     return f"{horas:02}:{minutos:02}:{segundos_restantes:02}"
-
 
 def obter_metadados_video(caminho_video: str):
     cmd = [
@@ -77,7 +72,6 @@ def obter_metadados_video(caminho_video: str):
         "duracao_segundos": str(round(duracao, 2))
     }
 
-
 def extrair_audio(caminho_video: str, caminho_audio: str):
     cmd = [
         "ffmpeg",
@@ -95,7 +89,6 @@ def extrair_audio(caminho_video: str, caminho_audio: str):
     if resultado.returncode != 0:
         raise Exception(f"Erro ao extrair áudio: {resultado.stderr}")
 
-
 def transcrever_audio(caminho_audio: str):
     with open(caminho_audio, "rb") as arquivo:
         resposta = GROQ_CLIENT.audio.transcriptions.create(
@@ -107,7 +100,6 @@ def transcrever_audio(caminho_audio: str):
 
     return resposta
 
-
 def analisar_viralidade(segmentos):
     segmentos_formatados = []
 
@@ -115,7 +107,10 @@ def analisar_viralidade(segmentos):
         inicio = round(segmento["start"], 2)
         fim = round(segmento["end"], 2)
         texto = segmento["text"].strip()
-        segmentos_formatados.append(f"[{inicio}s - {fim}s] {texto}")
+
+        segmentos_formatados.append(
+            f"[{inicio}s - {fim}s] {texto}"
+        )
 
     transcricao_formatada = "\n".join(segmentos_formatados)
 
@@ -159,7 +154,6 @@ Transcrição:
 
     return json.loads(resposta.choices[0].message.content)
 
-
 def cortar_video(entrada: str, saida: str, inicio: float, fim: float):
     duracao = fim - inicio
 
@@ -180,7 +174,6 @@ def cortar_video(entrada: str, saida: str, inicio: float, fim: float):
     if resultado.returncode != 0:
         raise Exception(f"Erro ao cortar vídeo: {resultado.stderr}")
 
-
 @app.get("/")
 def home():
     return {
@@ -189,7 +182,6 @@ def home():
         "llm": "gpt-5-mini",
         "transcricao": "whisper-large-v3-turbo"
     }
-
 
 @app.post("/api/upload")
 async def upload_video(
@@ -264,41 +256,3 @@ async def upload_video(
     except Exception as e:
         shutil.rmtree(pasta_temp, ignore_errors=True)
         raise HTTPException(status_code=500, detail=str(e))
-```
-
----
-
-# app.js
-
-Troca só este trecho:
-
-```js
-const dados = new FormData();
-dados.append('file', arquivo);
-
-const resposta = await fetch(`${API_BASE_URL}/api/upload`, {
-    method: 'POST',
-    headers: HEADERS_PADRAO,
-    body: dados,
-});
-```
-
-No teu código atual, substitui:
-
-```js
-dados.append('arquivo', arquivo);
-```
-
-por:
-
-```js
-dados.append('file', arquivo);
-```
-
-E garante que continua usando:
-
-```js
-fetch(`${API_BASE_URL}/api/upload`)
-```
-
-porque o main novo usa `/api/upload`.
