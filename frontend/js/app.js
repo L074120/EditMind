@@ -4,7 +4,7 @@
    ============================================================ */
 
 // String vazia = usa a mesma origem da pagina (funciona no HF Spaces e local)
-const API_BASE_URL = '';
+const API_BASE_URL = "https://editmind-ay26.onrender.com";
 
 const HEADERS_PADRAO = { 'ngrok-skip-browser-warning': 'true' };
 
