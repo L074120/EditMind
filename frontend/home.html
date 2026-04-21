@@ -141,11 +141,12 @@
     <script src="js/config.js"></script>
     <script src="js/auth.js"></script>
     <script>
-        // Se já estiver logado, muda o botão para ir direto ao app
-        if (Auth.estaLogado()) {
+        if (typeof Auth !== 'undefined' && Auth.estaLogado()) {
             const btn = document.getElementById('btn-comecar');
-            btn.textContent = 'Ir para o Estúdio →';
-            btn.href = 'index.html';
+            if (btn) {
+                btn.textContent = 'Ir para o Estúdio →';
+                btn.href = 'index.html';
+            }
         }
     </script>
 </body>
