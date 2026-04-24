@@ -116,12 +116,36 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="EditMind API", version="5.2.0", lifespan=lifespan)
 
+# ── CORS ──────────────────────────────────────────────────────
+# ATENÇÃO: allow_origins=["*"] + allow_credentials=True é inválido pelo padrão HTTP.
+# O browser bloqueia quando credentials são enviadas com wildcard origin.
+# Solução: listar as origens explícitas permitidas.
+_CORS_ORIGINS_ENV = os.getenv("CORS_ORIGINS", "")
+_CORS_ORIGINS: list[str] = (
+    [o.strip() for o in _CORS_ORIGINS_ENV.split(",") if o.strip()]
+    if _CORS_ORIGINS_ENV
+    else [
+        "https://front-edit-mind.vercel.app",
+        "https://editmind.vercel.app",
+        SITE_URL,
+        "http://localhost:3000",
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ]
+)
+# Garante que SITE_URL está sempre na lista (sem duplicatas)
+if SITE_URL and SITE_URL not in _CORS_ORIGINS:
+    _CORS_ORIGINS.append(SITE_URL)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-Requested-With"],
+    expose_headers=["Content-Disposition"],
 )
 
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
