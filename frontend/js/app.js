@@ -47,6 +47,18 @@ const DURACOES = [
     { value: 'longo', label: '> 60s' },
 ];
 
+const PRESET_PARA_DURACAO = {
+    '<30s': 'curto',
+    '30s-60s': 'medio',
+    '>60s': 'longo',
+};
+
+const DURACAO_PARA_PRESET = {
+    curto: '<30s',
+    medio: '30s-60s',
+    longo: '>60s',
+};
+
 let engineDuracaoPadrao = 'medio';
 let _iv = null;
 let _t0 = null;
@@ -80,17 +92,33 @@ document.addEventListener('DOMContentLoaded', () => {
     quantidadeRecortes?.addEventListener('change', renderRecortesConfig);
     renderRecortesConfig();
 
-    document.querySelectorAll('.engine-card[data-duration]').forEach(card => {
-        card.addEventListener('click', () => {
-            engineDuracaoPadrao = card.getAttribute('data-duration') || 'medio';
-            document.querySelectorAll('.engine-card[data-duration]').forEach(c => c.classList.remove('active'));
-            card.classList.add('active');
-            document.querySelectorAll('.recorte-duracao').forEach(select => {
-                select.value = engineDuracaoPadrao;
-            });
-        });
+    document.querySelectorAll('.engine-card[data-duration], .engine-card[data-preset]').forEach(card => {
+        card.addEventListener('click', () => selecionarEnginePreset(card));
     });
 });
+
+// ── ENGINE PRESETS ───────────────────────────────────────────
+function normalizarPresetEngine(valor) {
+    if (!valor) return 'medio';
+    const v = String(valor).trim();
+    if (PRESET_PARA_DURACAO[v]) return PRESET_PARA_DURACAO[v];
+    return ['curto', 'medio', 'longo'].includes(v) ? v : 'medio';
+}
+
+window.selecionarEnginePreset = function (card) {
+    if (!card) return;
+    const valor = card.getAttribute('data-preset') || card.getAttribute('data-duration') || 'medio';
+    engineDuracaoPadrao = normalizarPresetEngine(valor);
+
+    document.querySelectorAll('.engine-card[data-duration], .engine-card[data-preset]').forEach(c => {
+        c.classList.remove('active', 'selected');
+    });
+    card.classList.add('selected', 'active');
+
+    document.querySelectorAll('.recorte-duracao').forEach(select => {
+        select.value = engineDuracaoPadrao;
+    });
+};
 
 // ── AUTH HELPERS ─────────────────────────────────────────────
 function getAuthToken() {
@@ -305,6 +333,13 @@ async function processarLinkGenerico(inputId, btnId, nomeFonte) {
 window.processarYouTube = () => processarLinkGenerico('input-youtube', 'btn-yt-processar', 'YouTube');
 window.processarTikTok = () => processarLinkGenerico('input-tiktok', 'btn-tt-processar', 'TikTok');
 
+window.processarLink = function (plataforma) {
+    const p = String(plataforma || '').toLowerCase();
+    if (p === 'youtube') return window.processarYouTube();
+    if (p === 'tiktok') return window.processarTikTok();
+    alert('Plataforma não suportada.');
+};
+
 async function baixarLinkGenerico(inputId, btnId, nomeArquivo = 'Video_EditMind.mp4') {
     const input = $(inputId);
     const btn = $(btnId);
@@ -339,6 +374,13 @@ async function baixarLinkGenerico(inputId, btnId, nomeArquivo = 'Video_EditMind.
 
 window.baixarYouTube = () => baixarLinkGenerico('input-youtube', 'btn-yt-baixar', 'Video_YouTube_EditMind.mp4');
 window.baixarTikTok = () => baixarLinkGenerico('input-tiktok', 'btn-tt-baixar', 'Video_TikTok_EditMind.mp4');
+
+window.baixarLink = function (plataforma) {
+    const p = String(plataforma || '').toLowerCase();
+    if (p === 'youtube') return window.baixarYouTube();
+    if (p === 'tiktok') return window.baixarTikTok();
+    alert('Plataforma não suportada.');
+};
 
 // ── EXECUTOR GENÉRICO ─────────────────────────────────────────
 async function _executar(fetchFn) {
