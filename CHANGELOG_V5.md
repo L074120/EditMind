@@ -1,34 +1,116 @@
-# EditMind V5
+/* ============================================================
+   EditMind — js/auth.js  v3.0
+   Autenticação via FastAPI + Supabase.
 
-## Alterações principais
+   Novidades v3.0:
+   - esquecerSenha(email)  — dispara e-mail de reset
+   - redefinirSenha(token, novaSenha) — atualiza senha
+   - AbortSignal.timeout() em todas as chamadas
+   ============================================================ */
 
-- Removido o botão de demonstração da tela de login.
-- Adicionado botão de demonstração no CTA final da landing page.
-- Landing page recebeu o mesmo background radial usado no app autenticado.
-- Ferramentas Extras agora inclui YouTube e TikTok, com botões sem emojis e estilos separados.
-- Adicionados parâmetros de extração com cards: `< 30s`, `30s - 60s` e `> 60s`.
-- Novo Projeto agora permite configurar de 1 a 3 recortes por vídeo.
-- Cada recorte pode ter duração e foco próprios.
-- Backend atualizado para múltiplos recortes e prompt de IA que considera o vídeo inteiro.
-- Adicionado endpoint genérico `/api/processar-link` para YouTube/TikTok.
-- Adicionado endpoint genérico `/api/download-link`.
-- Download real de recortes mantido via `/api/cortes/download` com `Content-Disposition: attachment`.
-- Opção de saída vertical 9:16 sem achatamento, usando `scale` + `pad` no FFmpeg.
-- `MAX_DURACAO_S` agora é variável de ambiente. Default seguro: `180`. Para 30 minutos, configurar `MAX_DURACAO_S=1800` em plano Render adequado.
-- UX refinada para hover/zoom apenas em elementos realmente clicáveis.
+const Auth = Object.freeze({
 
-## Migração SQL
+    // ── Leitura de sessão ─────────────────────────────────────
 
-O arquivo `supabase_cortes.sql` foi atualizado com colunas opcionais:
+    estaLogado() {
+        const t = localStorage.getItem(CONFIG.TOKEN_KEY);
+        return Boolean(t && t !== 'null' && t !== 'undefined');
+    },
 
-- `inicio_segundos`
-- `fim_segundos`
-- `foco`
-- `duracao_tipo`
-- `formato_vertical`
+    getToken() {
+        return localStorage.getItem(CONFIG.TOKEN_KEY) || null;
+    },
 
-As alterações usam `add column if not exists`, então não quebram dados existentes.
+    getUsuario() {
+        try {
+            const raw = localStorage.getItem(CONFIG.USER_KEY);
+            return raw ? JSON.parse(raw) : null;
+        } catch {
+            localStorage.removeItem(CONFIG.USER_KEY);
+            return null;
+        }
+    },
 
-## Segurança do pacote
+    // ── Sessão ────────────────────────────────────────────────
 
-Este pacote não inclui `.env`, cookies, chaves privadas ou tokens.
+    _salvar(token, usuario) {
+        localStorage.setItem(CONFIG.TOKEN_KEY, token);
+        localStorage.setItem(CONFIG.USER_KEY, JSON.stringify(usuario));
+    },
+
+    logout() {
+        localStorage.removeItem(CONFIG.TOKEN_KEY);
+        localStorage.removeItem(CONFIG.USER_KEY);
+        window.location.href = '/';
+    },
+
+    exigirLogin(dest = 'login.html') {
+        if (!this.estaLogado()) { window.location.href = dest; return false; }
+        return true;
+    },
+
+
+    // ── Chamada genérica ao backend ───────────────────────────
+
+    async _post(rota, body, timeout = 15000) {
+        try {
+            const res = await fetch(`${CONFIG.API_URL}${rota}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                signal: AbortSignal.timeout(timeout),
+                body: JSON.stringify(body),
+            });
+            const dados = await res.json();
+            if (res.ok) return { sucesso: true, ...dados };
+            return { sucesso: false, erro: dados.detail || 'Erro desconhecido.' };
+        } catch (err) {
+            if (err.name === 'TimeoutError') return { sucesso: false, erro: 'Servidor demorou. Tente novamente.' };
+            return { sucesso: false, erro: 'Sem conexão com o servidor.' };
+        }
+    },
+
+    // ── Login ─────────────────────────────────────────────────
+
+    async login(email, senha) {
+        if (!email || !senha) return { sucesso: false, erro: 'Preencha todos os campos.' };
+        if (senha.length < 6) return { sucesso: false, erro: 'Senha mínima: 6 caracteres.' };
+
+        const res = await this._post('/api/auth/login', { email, senha });
+        if (res.sucesso && res.token) this._salvar(res.token, res.usuario || { email });
+        return res;
+    },
+
+    // ── Cadastro ──────────────────────────────────────────────
+
+    async cadastrar(nome, email, senha) {
+        if (!email || !senha) return { sucesso: false, erro: 'Preencha todos os campos.' };
+        if (senha.length < 6) return { sucesso: false, erro: 'Senha mínima: 6 caracteres.' };
+
+        const res = await this._post('/api/auth/cadastro', { email, senha });
+        if (res.sucesso && res.token) this._salvar(res.token, res.usuario || { email });
+        return res;
+    },
+
+    // ── Esqueci a senha ───────────────────────────────────────
+    // Envia e-mail com link de recovery para o usuário.
+    // O backend chama supabase.auth.reset_password_email()
+    // que redireciona para /redefinir-senha.html#access_token=...
+
+    async esquecerSenha(email) {
+        if (!email) return { sucesso: false, erro: 'Informe o e-mail.' };
+        return await this._post('/api/auth/esqueci-senha', { email });
+    },
+
+    // ── Redefinir senha ───────────────────────────────────────
+    // Chamado na página redefinir-senha.html após extrair
+    // o token do hash da URL.
+
+    async redefinirSenha(token, novaSenha) {
+        if (!token) return { sucesso: false, erro: 'Token inválido.' };
+        if (novaSenha.length < 6) return { sucesso: false, erro: 'Senha mínima: 6 caracteres.' };
+        return await this._post('/api/auth/redefinir-senha',
+            { token, nova_senha: novaSenha });
+    },
+});
+
+window.Auth = Auth;

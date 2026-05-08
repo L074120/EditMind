@@ -1,33 +1,25 @@
-# EditMind v5.1
+/* ============================================================
+   EditMind — js/config.js  v3.0
+   Ponto central de configuração. Altere só aqui.
+   ============================================================ */
 
-## Resumo
-Versão visual e funcional consolidada em cima da V5, preservando a base mais estável do backend e aplicando os trechos de UI solicitados.
+const CONFIG = Object.freeze({
 
-## Mantido da V5
-- Backend com múltiplos recortes.
-- Download real por endpoint backend.
-- Histórico de recortes.
-- Exclusão de recortes.
-- Suporte a YouTube/TikTok via endpoints genéricos.
-- Opção 9:16 sem achatar vídeo.
-- `MAX_DURACAO_S` configurável por ambiente.
+    // ── Backend (Render) ──────────────────────────────────────
+    API_URL: 'https://editmind-ay26.onrender.com',
 
-## Alterações v5.1
-- Ferramentas Extras agora usa o bloco visual solicitado para YouTube e TikTok.
-- Adicionados wrappers `processarLink('youtube'|'tiktok')` e `baixarLink('youtube'|'tiktok')` no `frontend/js/app.js`.
-- Ajustes da Engine agora usa o layout com cards `engine-grid`, `engine-card`, `engine-label`, `engine-name`, `engine-desc`.
-- Corrigido risco de ID duplicado: a seção continua `id="aba-configs"` e o wrapper interno virou `id="engine-configs"`.
-- CSS consolidado para YouTube vermelho, TikTok branco, botões secundários e cards de múltiplos cortes.
-- Background do `body` definido como `#0b0d11`, conforme solicitado.
-- Hover/cursor reforçado apenas para elementos clicáveis.
+    // ── Supabase (necessário para reset de senha no frontend) ─
+    // Copie do Dashboard Supabase > Project Settings > API
+    SUPABASE_URL: 'https://SEU-PROJETO.supabase.co',
+    SUPABASE_ANON_KEY: 'eyJ...',   // chave "anon public"
 
-## Arquivos principais alterados
-- `frontend/index.html`
-- `frontend/js/app.js`
-- `frontend/css/style.css`
-- `CHANGELOG_V5_1.md`
+    // ── localStorage keys ─────────────────────────────────────
+    TOKEN_KEY: 'editmind_token',
+    USER_KEY: 'editmind_user',
 
-## Validação executada
-- `python -m py_compile main.py`
-- `node --check frontend/js/app.js`
-- validação estrutural simples do HTML/CSS/JS
+    // ── Misc ──────────────────────────────────────────────────
+    VERSAO: '3.0.0',
+    MAX_DURACAO_AVISO: 180,
+});
+
+window.CONFIG = CONFIG;

@@ -1,9 +1,16 @@
-fastapi==0.111.0
-uvicorn[standard]==0.30.1
-python-multipart==0.0.9
-python-dotenv==1.0.1
-openai>=1.35.0
-yt-dlp>=2024.11.18
-supabase>=2.4.0
-httpx==0.27.2
-pydantic[email]>=2.0.0
+# EditMind V5.2
+
+## Alteração principal
+- Refinamento visual da aba **Ferramentas Extras** para ficar no padrão aprovado pelo usuário.
+
+## Ajustes aplicados
+- Cards de YouTube e TikTok lado a lado em desktop.
+- Separador `ou` entre Processar e Baixar.
+- Botão do YouTube em vermelho forte.
+- Botão do TikTok em branco.
+- Ícones, inputs, espaçamento e proporções dos cards refinados.
+- Mantida a base funcional da V5.1, sem alterar backend, múltiplos recortes, download real, histórico ou exclusão.
+
+## Arquivos alterados
+- `frontend/index.html`
+- `frontend/css/style.css`
