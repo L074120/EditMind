@@ -1,25 +1,45 @@
-# EditMind v4 — Checklist de Deploy
+-- EditMind v5.2 - Profiles
+create extension if not exists pgcrypto;
 
-## Supabase
-- [ ] Criar a tabela `public.cortes` rodando `supabase_cortes.sql`.
-- [ ] (Opcional recomendado) aplicar `supabase_full_audit_v5_2.sql` para criação/migração consolidada (cortes + profiles + policies + bucket).
-- [ ] Criar o bucket `cortes` em Storage e marcar como **Public**.
-- [ ] Em Storage > Policies, permitir `INSERT`/`UPDATE`/`DELETE` para `service_role` no bucket `cortes`.
-- [ ] Em Authentication > URL Configuration, definir `Site URL` como a URL final da Vercel.
-- [ ] Em Authentication > Redirect URLs, adicionar a URL pública de `redefinir-senha.html`.
-- [ ] Copiar `SUPABASE_URL`, `anon key` e `service_role key`.
+create table if not exists public.profiles (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null unique,
+  email text,
+  nome text,
+  criado_em timestamptz not null default now(),
+  atualizado_em timestamptz not null default now()
+);
 
-## Render (backend)
-- [ ] **Recomendado:** criar um Web Service com runtime **Docker** apontando para a raiz do repositório.
-- [ ] O `Dockerfile` já instala `ffmpeg`, atualiza `yt-dlp` e sobe `uvicorn` usando `${PORT}` do Render.
-- [ ] Variáveis: `OPENAI_API_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`, `SUPABASE_SERVICE_KEY`, `SITE_URL`.
-- [ ] Opcional para YouTube mais resiliente: `YTDLP_COOKIES_FILE` e `YTDLP_EXTRACTOR_ARGS`.
-- [ ] **Alternativa nativa (Python runtime):** Build Command `pip install -r requirements.txt` e Start Command `uvicorn main:app --host 0.0.0.0 --port $PORT`, mas só use se você garantir `ffmpeg`/`ffprobe` no ambiente.
+create or replace function public.set_profiles_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.atualizado_em = now();
+  return new;
+end;
+$$;
 
-## Vercel (frontend)
-- [ ] Importar o mesmo repositório na Vercel.
-- [ ] Root Directory: `/`
-- [ ] Framework Preset: `Other`
-- [ ] Não definir Output Directory.
-- [ ] Validar que `/` abre `home.html`, `/login` abre `login.html` e `/app` abre `index.html`.
-- [ ] Editar `js/config.js` com a URL pública do backend Render e as chaves públicas do Supabase.
+drop trigger if exists trg_profiles_updated_at on public.profiles;
+create trigger trg_profiles_updated_at
+before update on public.profiles
+for each row execute function public.set_profiles_updated_at();
+
+alter table public.profiles enable row level security;
+
+-- leitura/escrita do próprio usuário em cenários sem service role
+create policy if not exists "profiles_select_own"
+on public.profiles
+for select
+using (auth.uid() = user_id);
+
+create policy if not exists "profiles_insert_own"
+on public.profiles
+for insert
+with check (auth.uid() = user_id);
+
+create policy if not exists "profiles_update_own"
+on public.profiles
+for update
+using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
