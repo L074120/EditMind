@@ -60,16 +60,6 @@ YTDLP_EXTRACTOR_ARGS = os.getenv("YTDLP_EXTRACTOR_ARGS", "youtube:player_client=
 MAX_DURACAO_S = int(os.getenv("MAX_DURACAO_S", "180"))
 MAX_BYTES = int(os.getenv("MAX_BYTES", str(200 * 1024 * 1024)))
 
-# Modo de apresentação: mantém as funcionalidades existentes, mas limita o trecho
-# realmente analisado/renderizado para a demonstração caber em cerca de 1min–1min30.
-PROCESSAMENTO_RAPIDO_APRESENTACAO = os.getenv("PROCESSAMENTO_RAPIDO_APRESENTACAO", "1").strip().lower() not in {"0", "false", "no", "off", "nao", "não"}
-MAX_TRECHO_PROCESSAMENTO_S = float(os.getenv("MAX_TRECHO_PROCESSAMENTO_S", "90"))
-CORRIGIR_TRANSCRICAO = os.getenv("CORRIGIR_TRANSCRICAO", "0").strip().lower() in {"1", "true", "yes", "on", "sim"}
-OPENAI_MODELO_ANALISE = os.getenv("OPENAI_MODELO_ANALISE", "gpt-4o-mini")
-FFMPEG_PRESET_CORTE = os.getenv("FFMPEG_PRESET_CORTE", "ultrafast")
-VERTICAL_W = int(os.getenv("VERTICAL_W", "720"))
-VERTICAL_H = int(os.getenv("VERTICAL_H", "1280"))
-
 # ── Clientes ──────────────────────────────────────────────────
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -86,6 +76,12 @@ supabase_admin: Optional[Client] = (
 STORAGE_BUCKET = "cortes"
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+OUTPUT_TEMP_DIR = OUTPUT_DIR / "temp"
+OUTPUT_PROJECTS_DIR = OUTPUT_DIR / "projects"
+for _d in (OUTPUT_TEMP_DIR, OUTPUT_PROJECTS_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
 
 EXTS_VALIDAS = {".mp4", ".mov", ".avi", ".webm"}
 DOMINIOS_SUPORTADOS = {"youtube.com", "www.youtube.com", "youtu.be", "tiktok.com", "www.tiktok.com", "vm.tiktok.com"}
@@ -119,8 +115,6 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Supabase Auth : {'✅' if supabase else '❌'}")
     logger.info(f"   Supabase Admin: {'✅' if supabase_admin else '❌ (SUPABASE_SERVICE_KEY ausente)'}")
     logger.info(f"   MAX_DURACAO_S : {MAX_DURACAO_S}s")
-    logger.info(f"   Modo rápido    : {'✅' if PROCESSAMENTO_RAPIDO_APRESENTACAO else '❌'} ({MAX_TRECHO_PROCESSAMENTO_S:.0f}s)")
-    logger.info(f"   Modelo análise : {OPENAI_MODELO_ANALISE}")
     logger.info(f"   Cookies yt-dlp: {'✅' if YTDLP_COOKIES_FILE and Path(YTDLP_COOKIES_FILE).exists() else '❌'}")
     yield
     logger.info("🛑 Encerrada")
@@ -451,8 +445,8 @@ async def normalizar_video_para_browser(entrada: str, saida: str, forcar_reencod
 
     await _ffmpeg(
         "-y", "-i", entrada,
-        "-c:v", "libx264", "-preset", FFMPEG_PRESET_CORTE, "-crf", "22",
-        "-pix_fmt", "yuv420p", "-threads", "0",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k", "-ac", "2",
         "-movflags", "+faststart",
         saida,
@@ -468,28 +462,21 @@ async def extrair_audio(video: str, audio: str) -> None:
 
 
 async def cortar_video(entrada: str, saida: str, inicio: float, fim: float, formato_vertical: bool = False) -> None:
-    inicio = max(0.0, float(inicio))
-    duracao_corte = max(0.1, float(fim) - inicio)
-
     if formato_vertical:
-        # Vertical 9:16 sem achatamento. Em modo apresentação usa 720p vertical
-        # para renderizar mais rápido e ainda ficar adequado para Shorts/Reels/TikTok.
-        filtro = (
-            f"scale={VERTICAL_W}:{VERTICAL_H}:force_original_aspect_ratio=decrease,"
-            f"pad={VERTICAL_W}:{VERTICAL_H}:(ow-iw)/2:(oh-ih)/2,setsar=1"
-        )
+        # Vertical 9:16 sem achatamento: mantém proporção e adiciona padding.
+        filtro = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1"
         await _ffmpeg(
-            "-y", "-ss", str(inicio), "-i", entrada, "-t", str(duracao_corte),
+            "-y", "-ss", str(inicio), "-to", str(fim), "-i", entrada,
             "-vf", filtro,
-            "-c:v", "libx264", "-preset", FFMPEG_PRESET_CORTE, "-crf", "24", "-threads", "0",
-            "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart", saida
         )
     else:
         await _ffmpeg(
-            "-y", "-ss", str(inicio), "-i", entrada, "-t", str(duracao_corte),
-            "-c:v", "libx264", "-preset", FFMPEG_PRESET_CORTE, "-crf", "23", "-pix_fmt", "yuv420p", "-threads", "0",
-            "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+            "-y", "-ss", str(inicio), "-to", str(fim), "-i", entrada,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
             "-movflags", "+faststart", saida
         )
 
@@ -532,37 +519,11 @@ def config_from_link_request(dados: LinkRequest) -> ProcessamentoConfig:
     return ProcessamentoConfig(cortes=dados.cortes or [CorteConfig()], formato_vertical=dados.formato_vertical)
 
 
-async def preparar_trecho_rapido(video_path: str, pasta_temp: Path, duracao: float, metadados: dict) -> tuple[str, float, dict]:
-    """Cria uma amostra temporária para apresentação sem alterar o arquivo enviado pelo usuário."""
-    if not PROCESSAMENTO_RAPIDO_APRESENTACAO or MAX_TRECHO_PROCESSAMENTO_S <= 0 or duracao <= MAX_TRECHO_PROCESSAMENTO_S:
-        return video_path, duracao, metadados
-
-    trecho_path = str(pasta_temp / "trecho_apresentacao.mp4")
-    duracao_trecho = min(MAX_TRECHO_PROCESSAMENTO_S, duracao)
-    logger.info(f"Modo rápido | usando trecho temporário de {duracao_trecho:.0f}s para acelerar a apresentação.")
-    await _ffmpeg(
-        "-y", "-ss", "0", "-i", video_path, "-t", str(duracao_trecho),
-        "-c:v", "libx264", "-preset", FFMPEG_PRESET_CORTE, "-crf", "24", "-pix_fmt", "yuv420p", "-threads", "0",
-        "-c:a", "aac", "-b:a", "96k", "-ac", "2",
-        "-movflags", "+faststart",
-        trecho_path,
-    )
-
-    meta_trecho = await obter_metadados(trecho_path)
-    meta_trecho["duracao_original_segundos"] = metadados.get("duracao_segundos", str(duracao))
-    meta_trecho["modo_rapido_apresentacao"] = "true"
-    try:
-        duracao_final = float(meta_trecho.get("duracao_segundos", duracao_trecho))
-    except Exception:
-        duracao_final = duracao_trecho
-    return trecho_path, duracao_final, meta_trecho
-
-
 # ══════════════════════════════════════════════════════════════
 # HELPERS — YT-DLP (YouTube/TikTok)
 # ══════════════════════════════════════════════════════════════
 
-async def _ytdlp_download(url: str, output_path: str, limitar_para_processamento: bool = False) -> None:
+async def _ytdlp_download(url: str, output_path: str) -> None:
     validar_url_midia(url)
     common_args = [
         "--merge-output-format", "mp4",
@@ -574,19 +535,19 @@ async def _ytdlp_download(url: str, output_path: str, limitar_para_processamento
         "--fragment-retries", "8",
         "--file-access-retries", "8",
         "--socket-timeout", "30",
-        "--retry-sleep", "1",
+        "--retry-sleep", "2",
+        "--sleep-requests", "1",
+        "--sleep-interval", "1",
+        "--max-sleep-interval", "4",
         "--no-cache-dir",
         "--extractor-args", YTDLP_EXTRACTOR_ARGS,
         "--user-agent", YT_DLP_USER_AGENT,
         "--add-header", "Accept-Language:pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
         "--add-header", "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     ]
-    if limitar_para_processamento and PROCESSAMENTO_RAPIDO_APRESENTACAO and MAX_TRECHO_PROCESSAMENTO_S > 0:
-        common_args.extend(["--download-sections", f"*0-{int(MAX_TRECHO_PROCESSAMENTO_S)}"])
-
     formatos = [
-        "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best[height<=720]/best",
         "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+        "bv*[height<=720]+ba/b[height<=720]/best",
         "best",
     ]
 
@@ -614,7 +575,7 @@ async def _ytdlp_download(url: str, output_path: str, limitar_para_processamento
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=240)
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=420)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.communicate()
@@ -656,9 +617,7 @@ async def transcrever(audio_path: str) -> str:
             model="whisper-1", file=f, language="pt", response_format="text"
         )
 
-    texto = (resp if isinstance(resp, str) else getattr(resp, "text", "")).strip()
-    if not CORRIGIR_TRANSCRICAO or not texto:
-        return texto
+    texto = resp if isinstance(resp, str) else getattr(resp, "text", "")
 
     corr = await openai_client.chat.completions.create(
         model="gpt-4o-mini",
@@ -766,13 +725,13 @@ async def analisar_viral_multiplos(transcricao: str, duracao: float, configs: li
     }
 
     resp = await openai_client.chat.completions.create(
-        model=OPENAI_MODELO_ANALISE,
+        model="gpt-4o",
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
         ],
         temperature=0.25,
-        max_tokens=700,
+        max_tokens=900,
         response_format={"type": "json_object"},
     )
 
@@ -839,6 +798,9 @@ async def salvar_registro_corte(
     titulo: str,
     corte: Optional[dict] = None,
     formato_vertical: bool = False,
+    project_id: Optional[str] = None,
+    parent_corte_id: Optional[str] = None,
+    is_edited: bool = False,
 ) -> Optional[dict]:
     if not user_email:
         raise ValueError("user_email é obrigatório para salvar o corte.")
@@ -856,6 +818,9 @@ async def salvar_registro_corte(
         "foco": corte.get("foco"),
         "duracao_tipo": corte.get("duracao_tipo"),
         "formato_vertical": formato_vertical,
+        "project_id": project_id,
+        "parent_corte_id": parent_corte_id,
+        "is_edited": is_edited,
     }
     payload_limpo = {k: v for k, v in payload.items() if v is not None}
     payload_basico = {"user_email": user_email, "video_url": video_url, "titulo": titulo}
@@ -992,23 +957,21 @@ async def _atualizar_auth_user(token: str, payload: dict) -> dict:
 # PIPELINE CENTRAL
 # ══════════════════════════════════════════════════════════════
 
-async def _pipeline(video_path: str, job_id: str, tasks: BackgroundTasks, pasta_temp: Path, config: ProcessamentoConfig) -> dict:
+async def _pipeline(video_path: str, job_id: str, tasks: BackgroundTasks, pasta_temp: Path, config: ProcessamentoConfig, project_id: str, persist: bool = False) -> dict:
     metadados = await obter_metadados(video_path)
     duracao = float(metadados["duracao_segundos"])
     logger.info(f"Job {job_id} | metadados: {metadados}")
 
-    if duracao > MAX_DURACAO_S and not PROCESSAMENTO_RAPIDO_APRESENTACAO:
+    if duracao > MAX_DURACAO_S:
         raise HTTPException(
             413,
             f"Vídeo longo demais ({int(duracao)}s). Limite atual: {MAX_DURACAO_S}s. "
             "Para até 30 minutos, configure MAX_DURACAO_S=1800 em um plano Render adequado.",
         )
 
-    video_processamento, duracao, metadados_resposta = await preparar_trecho_rapido(video_path, pasta_temp, duracao, metadados)
-
     audio_path = str(pasta_temp / "audio.mp3")
     logger.info(f"Job {job_id} | extraindo áudio...")
-    await extrair_audio(video_processamento, audio_path)
+    await extrair_audio(video_path, audio_path)
 
     logger.info(f"Job {job_id} | transcrevendo...")
     transcricao = await transcrever(audio_path)
@@ -1020,14 +983,16 @@ async def _pipeline(video_path: str, job_id: str, tasks: BackgroundTasks, pasta_
     for analise in analises:
         idx = analise["index"]
         nome_saida = f"corte_{job_id}_{idx}.mp4" if len(analises) > 1 else f"corte_{job_id}.mp4"
-        caminho_local = str(OUTPUT_DIR / nome_saida)
+        base_dir = (OUTPUT_PROJECTS_DIR / project_id / "cuts") if persist else (OUTPUT_TEMP_DIR / project_id)
+        base_dir.mkdir(parents=True, exist_ok=True)
+        caminho_local = str(base_dir / nome_saida)
         logger.info(f"Job {job_id} | cortando recorte {idx}: {analise['inicio']}s → {analise['fim']}s")
-        await cortar_video(video_processamento, caminho_local, analise["inicio"], analise["fim"], config.formato_vertical)
+        await cortar_video(video_path, caminho_local, analise["inicio"], analise["fim"], config.formato_vertical)
 
-        url_publica = await upload_storage(caminho_local, nome_saida)
+        url_publica = None if not persist else await upload_storage(caminho_local, nome_saida)
         if url_publica:
             tasks.add_task(lambda p=caminho_local: Path(p).unlink(missing_ok=True))
-        url_corte = url_publica or f"/outputs/{nome_saida}"
+        url_corte = url_publica or (f"/outputs/projects/{project_id}/cuts/{nome_saida}" if persist else f"/outputs/temp/{project_id}/{nome_saida}")
 
         corte_info = {
             "index": idx,
@@ -1053,7 +1018,7 @@ async def _pipeline(video_path: str, job_id: str, tasks: BackgroundTasks, pasta_
         "transcricao": transcricao,
         "corte_sugerido": {k: primeiro[k] for k in ["inicio", "fim", "inicio_segundos", "fim_segundos", "motivo"]},
         "cortes": cortes_resposta,
-        "detalhes_tecnicos": metadados_resposta,
+        "detalhes_tecnicos": metadados,
         "url_corte": primeiro["url_corte"],
         "storage": primeiro["storage"],
     }
@@ -1073,6 +1038,42 @@ async def _salvar_cortes_do_resultado(usuario: dict, titulo_base: str, resultado
         if registro and registro.get("id"):
             corte["id"] = registro.get("id")
     return resultado
+
+
+def _project_file(project_id: str) -> Path:
+    return OUTPUT_PROJECTS_DIR / project_id / "original_info.json"
+
+
+def _load_project(project_id: str) -> dict:
+    pf = _project_file(project_id)
+    if not pf.exists():
+        raise HTTPException(404, "Projeto não encontrado.")
+    return json.loads(pf.read_text(encoding="utf-8"))
+
+
+def _save_project(project: dict) -> None:
+    project_id = str(project.get("project_id") or "").strip()
+    if not project_id:
+        raise HTTPException(400, "project_id inválido")
+    base = OUTPUT_PROJECTS_DIR / project_id
+    (base / "cuts").mkdir(parents=True, exist_ok=True)
+    project["project_path"] = f"/outputs/projects/{project_id}"
+    (_project_file(project_id)).write_text(json.dumps(project, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _create_project(original_name: str, source: str, owner: str) -> dict:
+    project_id = str(uuid.uuid4())[:8]
+    data = {
+        "project_id": project_id,
+        "original_title": original_name,
+        "source": source,
+        "created_at": __import__('datetime').datetime.utcnow().isoformat() + "Z",
+        "owner": owner,
+        "cuts": [],
+    }
+    _save_project(data)
+    return data
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1212,8 +1213,10 @@ async def processar_video(
                     raise HTTPException(413, f"Arquivo muito grande. Máx {MAX_BYTES // 1024 // 1024}MB.")
                 f_out.write(chunk)
 
-        resultado = await _pipeline(str(video_path), job_id, tasks, pasta_temp, config)
-        resultado = await _salvar_cortes_do_resultado(usuario, file.filename or f"upload_{job_id}", resultado)
+        projeto = _create_project(file.filename or f"upload_{job_id}", "upload", usuario.get("email") or usuario.get("id") or "anon")
+        resultado = await _pipeline(str(video_path), job_id, tasks, pasta_temp, config, projeto["project_id"], persist=False)
+        resultado["project"] = projeto
+        resultado["status"] = "preview_pronto"
         return JSONResponse(resultado)
     except HTTPException:
         shutil.rmtree(pasta_temp, ignore_errors=True)
@@ -1232,11 +1235,14 @@ async def processar_link(tasks: BackgroundTasks, dados: LinkRequest, usuario: di
     video_path = str(pasta_temp / "video.mp4")
     logger.info(f"Link Job {job_id} | usuário: {usuario['email']} | {dados.url} | cortes={len(config.cortes)}")
     try:
-        await _ytdlp_download(dados.url, video_path, limitar_para_processamento=True)
+        await _ytdlp_download(dados.url, video_path)
         video_normalizado = str(pasta_temp / "video_browser.mp4")
         await normalizar_video_para_browser(video_path, video_normalizado, forcar_reencode=eh_tiktok_url(dados.url))
-        resultado = await _pipeline(video_normalizado, job_id, tasks, pasta_temp, config)
-        resultado = await _salvar_cortes_do_resultado(usuario, dados.url, resultado)
+        origem = "youtube" if eh_youtube_url(dados.url) else ("tiktok" if eh_tiktok_url(dados.url) else "link")
+        projeto = _create_project(dados.url, origem, usuario.get("email") or usuario.get("id") or "anon")
+        resultado = await _pipeline(video_normalizado, job_id, tasks, pasta_temp, config, projeto["project_id"], persist=False)
+        resultado["project"] = projeto
+        resultado["status"] = "preview_pronto"
         return JSONResponse(resultado)
     except asyncio.TimeoutError:
         shutil.rmtree(pasta_temp, ignore_errors=True)
@@ -1299,6 +1305,72 @@ async def download_youtube(tasks: BackgroundTasks, dados: YouTubeRequest, usuari
     return await download_link(tasks, req, usuario)
 
 
+
+class ConfirmarCortesRequest(BaseModel):
+    selected_indexes: list[int] = Field(default_factory=list)
+
+class EditarCorteRequest(BaseModel):
+    start: float
+    end: float
+    replace_original: bool = False
+
+
+@app.post("/api/projetos/{project_id}/confirmar-cortes")
+async def confirmar_cortes(project_id: str, dados: ConfirmarCortesRequest, usuario: dict = Depends(get_current_user)):
+    projeto = _load_project(project_id)
+    owner = usuario.get("email") or usuario.get("id")
+    if projeto.get("owner") != owner:
+        raise HTTPException(403, "Projeto não pertence ao usuário autenticado.")
+    temp_dir = OUTPUT_TEMP_DIR / project_id
+    if not temp_dir.exists():
+        raise HTTPException(404, "Pré-visualizações temporárias não encontradas.")
+    selected = set(int(i) for i in dados.selected_indexes or [])
+    persisted = []
+    for path in sorted(temp_dir.glob("*.mp4")):
+        m = re.search(r"_(\d+)\.mp4$", path.name)
+        idx = int(m.group(1)) if m else 1
+        if idx not in selected:
+            continue
+        destino = OUTPUT_PROJECTS_DIR / project_id / "cuts" / path.name
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(destino))
+        corte = {"index": idx, "video_url": f"/outputs/projects/{project_id}/cuts/{path.name}", "criado_em": __import__('datetime').datetime.utcnow().isoformat()+"Z"}
+        persisted.append(corte)
+        projeto.setdefault("cuts", []).append(corte)
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    _save_project(projeto)
+    return {"sucesso": True, "project_id": project_id, "saved_cuts": persisted, "project": projeto}
+
+
+@app.get("/api/projetos")
+async def listar_projetos(usuario: dict = Depends(get_current_user)):
+    owner = usuario.get("email") or usuario.get("id")
+    projetos = []
+    for meta in OUTPUT_PROJECTS_DIR.glob("*/original_info.json"):
+        data = json.loads(meta.read_text(encoding="utf-8"))
+        if data.get("owner") == owner:
+            cuts = data.get("cuts") or []
+            data["clips_count"] = len(cuts)
+            data["thumbnail_url"] = (cuts[0] or {}).get("video_url") if cuts else None
+            data["status"] = data.get("status") or ("concluido" if cuts else "processado")
+            projetos.append(data)
+    projetos.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return {"sucesso": True, "projetos": projetos}
+
+
+@app.get("/api/projetos/{project_id}")
+async def detalhe_projeto(project_id: str, usuario: dict = Depends(get_current_user)):
+    projeto = _load_project(project_id)
+    owner = usuario.get("email") or usuario.get("id")
+    if projeto.get("owner") != owner:
+        raise HTTPException(403, "Projeto não pertence ao usuário autenticado.")
+    cuts = projeto.get("cuts") or []
+    projeto["clips_count"] = len(cuts)
+    projeto["thumbnail_url"] = (cuts[0] or {}).get("video_url") if cuts else None
+    projeto["status"] = projeto.get("status") or ("concluido" if cuts else "processado")
+    return {"sucesso": True, "projeto": projeto}
+
+
 # ══════════════════════════════════════════════════════════════
 # ENDPOINTS — HISTÓRICO / DOWNLOAD / DELETE
 # ══════════════════════════════════════════════════════════════
@@ -1324,6 +1396,102 @@ async def meus_cortes(usuario: dict = Depends(get_current_user)):
     except Exception as e:
         logger.error(f"Erro ao buscar cortes do usuário: {e}")
         raise HTTPException(500, "Erro ao buscar histórico de cortes.")
+
+
+@app.post("/api/cortes/{corte_id}/editar")
+async def editar_corte(corte_id: str, dados: EditarCorteRequest, usuario: dict = Depends(get_current_user)):
+    if not supabase_admin:
+        raise HTTPException(503, "Banco indisponível.")
+    user_email = usuario.get("email")
+    if not user_email:
+        raise HTTPException(401, "Usuário inválido: email ausente no token.")
+
+    start = float(dados.start)
+    end = float(dados.end)
+    if start < 0:
+        raise HTTPException(400, "start deve ser >= 0.")
+    if end <= start:
+        raise HTTPException(400, "end deve ser maior que start.")
+    if (end - start) < 1.0:
+        raise HTTPException(400, "A duração mínima do corte editado é de 1 segundo.")
+
+    busca = await asyncio.to_thread(
+        lambda: supabase_admin.table("cortes")
+        .select("*")
+        .eq("id", corte_id)
+        .eq("user_email", user_email)
+        .limit(1)
+        .execute()
+    )
+    corte_original = (busca.data or [None])[0]
+    if not corte_original:
+        raise HTTPException(404, "Recorte não encontrado.")
+
+    original_url = str(corte_original.get("video_url") or "")
+    if not original_url.startswith("/outputs/"):
+        raise HTTPException(400, "Edição suportada apenas para vídeos locais (/outputs) nesta versão.")
+    input_path = Path(original_url.removeprefix("/")).resolve()
+    if not input_path.exists():
+        raise HTTPException(404, "Arquivo de vídeo original não encontrado.")
+
+    meta = await obter_metadados(str(input_path))
+    duracao_real = float(meta.get("duracao_segundos") or 0)
+    if end > duracao_real:
+        raise HTTPException(400, f"end não pode ultrapassar a duração real ({duracao_real:.2f}s).")
+
+    output_name = f"{sanitizar(input_path.stem)}_edit_{uuid.uuid4().hex[:8]}.mp4"
+    output_path = input_path.parent / output_name
+
+    await _ffmpeg(
+        "-y", "-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(input_path),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+        "-movflags", "+faststart",
+        str(output_path),
+    )
+
+    novo_url = f"/{output_path.as_posix()}"
+    project_id = corte_original.get("project_id")
+    novo_corte = await salvar_registro_corte(
+        user_email=user_email,
+        video_url=novo_url,
+        titulo=f"{corte_original.get('titulo') or 'Recorte'} (editado)",
+        corte={"inicio": start, "fim": end, "foco": corte_original.get("foco"), "duracao_tipo": "custom"},
+        formato_vertical=bool(corte_original.get("formato_vertical")),
+        project_id=project_id,
+        parent_corte_id=corte_id,
+        is_edited=True,
+    )
+
+    if project_id:
+        try:
+            projeto = _load_project(project_id)
+            projeto.setdefault("cuts", []).append({
+                "index": len(projeto.get("cuts") or []) + 1,
+                "video_url": novo_url,
+                "criado_em": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+                "edited_from": corte_id,
+            })
+            _save_project(projeto)
+        except Exception as e:
+            logger.warning(f"Falha ao atualizar projeto na edição ({project_id}): {e}")
+
+    if dados.replace_original:
+        try:
+            await _remover_arquivo_corte(original_url)
+        except Exception as e:
+            logger.warning(f"Falha ao remover arquivo original editado: {e}")
+        await asyncio.to_thread(lambda: supabase_admin.table("cortes").delete().eq("id", corte_id).eq("user_email", user_email).execute())
+
+    return {
+        "ok": True,
+        "corte": {
+            "id": (novo_corte or {}).get("id"),
+            "project_id": project_id,
+            "url": novo_url,
+            "duration": round(end - start, 2),
+        },
+    }
 
 
 @app.get("/api/cortes/download")
@@ -1514,8 +1682,5 @@ async def health():
             "supabase_auth": "ok" if supabase else "ausente",
             "supabase_storage": "ok" if supabase_admin else "ausente (SUPABASE_SERVICE_KEY)",
             "max_duracao_s": MAX_DURACAO_S,
-            "modo_rapido_apresentacao": PROCESSAMENTO_RAPIDO_APRESENTACAO,
-            "max_trecho_processamento_s": MAX_TRECHO_PROCESSAMENTO_S,
-            "modelo_analise": OPENAI_MODELO_ANALISE,
         },
     }

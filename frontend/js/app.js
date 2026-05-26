@@ -7,7 +7,7 @@
    ============================================================ */
 
 const API = window.CONFIG?.API_URL ?? '';
-const TIMEOUT = 150 * 1000;
+const TIMEOUT = 5 * 60 * 1000;
 
 const $ = id => document.getElementById(id);
 
@@ -43,8 +43,11 @@ const profileSenha = $('profile-senha');
 const profileFeedback = $('profile-feedback');
 
 window.ultimoResultado = null;
+window.previewSelecionados = new Set();
 window.meusCortes = [];
+window.projetosConteudo = [];
 window.selectedCortes = new Set();
+window.projetoAtualId = null;
 
 const FOCOS = [
     'Livre', 'Humor', 'Terror', 'Emocionante', 'Triste',
@@ -367,6 +370,7 @@ async function processarLinkGenerico(inputId, btnId, nomeFonte) {
     if (btn) { btn.disabled = true; btn.textContent = 'Processando...'; }
 
     const config = coletarConfigProcessamento();
+    try {
     await _executar(async (ctrl) =>
         fetch(`${API}/api/processar-link`, {
             method: 'POST',
@@ -376,8 +380,10 @@ async function processarLinkGenerico(inputId, btnId, nomeFonte) {
         })
     );
 
-    if (btn) { btn.textContent = 'Processar'; btn.disabled = false; }
-    if (input) input.value = '';
+    } finally {
+        if (btn) { btn.textContent = 'Processar'; btn.disabled = false; }
+        if (input) input.value = '';
+    }
 }
 
 window.processarYouTube = () => processarLinkGenerico('input-youtube', 'btn-yt-processar', 'YouTube');
@@ -439,11 +445,11 @@ async function _executar(fetchFn) {
 
     const etapas = [
         { p: 10, m: 'Enviando para o servidor...', d: 0 },
-        { p: 25, m: 'Preparando mídia para apresentação...', d: 4000 },
-        { p: 50, m: 'Whisper transcrevendo o trecho...', d: 12000 },
-        { p: 70, m: 'IA avaliando o conteúdo...', d: 24000 },
-        { p: 85, m: 'Selecionando recortes por foco...', d: 45000 },
-        { p: 93, m: 'Renderizando os cortes...', d: 70000 },
+        { p: 25, m: 'FFmpeg extraindo áudio...', d: 5000 },
+        { p: 50, m: 'Whisper transcrevendo...', d: 12000 },
+        { p: 70, m: 'IA avaliando o vídeo inteiro...', d: 22000 },
+        { p: 85, m: 'Selecionando recortes por foco...', d: 32000 },
+        { p: 93, m: 'Renderizando os cortes...', d: 42000 },
     ];
     const tids = etapas.map(({ p, m, d }) => setTimeout(() => { pct(p); msg(m); }, d));
 
@@ -479,7 +485,7 @@ async function _executar(fetchFn) {
     } catch (err) {
         clearTimeout(tId); tids.forEach(clearTimeout); stopTimer();
         const m_ = err.name === 'AbortError'
-            ? 'Timeout: processamento demorou mais de 2min30.'
+            ? 'Timeout: processamento demorou mais de 5 minutos.'
             : `${err.message || 'Erro desconhecido.'}`;
         msg(m_, '#ef4444');
         if (barraP) barraP.style.background = '#ef4444';
@@ -521,7 +527,7 @@ function exibirResultado(data) {
 
     const area = $('area-download');
     if (!area) return;
-    area.innerHTML = cortes.map((corte, idx) => renderCorteResultado(corte, idx)).join('');
+    area.innerHTML = cortes.map((corte, idx) => renderCorteResultado(corte, idx)).join('') + '<div class="result-btns"><button type="button" id="btn-confirmar-cortes" class="btn-upload">Salvar cortes selecionados</button></div>';
 }
 
 function renderCorteResultado(corte, idx) {
@@ -546,6 +552,7 @@ function renderCorteResultado(corte, idx) {
             <p class="resultado-motivo">${escaparHtml(corte.motivo || 'Trecho viral identificado.')}</p>
             <div class="result-btns">
                 <button type="button" class="btn-assistir btn-play-inline">Assistir</button>
+                <label><input type="checkbox" class="preview-select" data-index="${corte.index || idx+1}" checked> Salvar</label>
                 <button type="button" class="btn-download btn-download-video" data-url="${urlCorte}">Baixar MP4</button>
             </div>
         </article>
@@ -559,6 +566,7 @@ window.resetarNovoCorte = function () {
         if (painelUpload) painelUpload.classList.remove('hidden');
         resetUI();
         window.ultimoResultado = null;
+window.previewSelecionados = new Set();
     }, 400);
 };
 
@@ -628,7 +636,42 @@ function renderConteudos(cortes) {
     }
     limparSelecaoCortes();
 
-    conteudosLista.innerHTML = window.meusCortes.map((corte) => {
+    const agrupar = new Map();
+    window.meusCortes.forEach((c) => {
+        const pid = c.project_id || 'sem-projeto';
+        if (!agrupar.has(pid)) agrupar.set(pid, []);
+        agrupar.get(pid).push(c);
+    });
+    window.projetosConteudo = Array.from(agrupar.entries()).map(([project_id, clips]) => ({ project_id, clips }));
+    renderListaProjetos();
+}
+
+function renderListaProjetos() {
+    if (!conteudosLista) return;
+    if (!window.projetosConteudo.length) return renderEmptyStateConteudos();
+    conteudosLista.innerHTML = window.projetosConteudo.map((projeto) => {
+        const primeiro = projeto.clips[0] || {};
+        const titulo = escaparHtml(primeiro.titulo || `Projeto ${projeto.project_id}`);
+        const dataFmt = formatarDataPtBR(primeiro.criado_em);
+        const status = primeiro.status || 'concluído';
+        const preview = montarUrlVideo(primeiro.video_url || '');
+        return `
+            <article class="tool-bentoCard conteudo-card">
+                <h3 class="tool-title conteudo-title">${titulo}</h3>
+                <p class="tool-description conteudo-date">Criado em: ${dataFmt}</p>
+                <p class="conteudo-tags">Clipes: <b>${projeto.clips.length}</b> · Status: <b>${escaparHtml(status)}</b></p>
+                ${preview ? `<video src="${preview}" controls preload="metadata" class="conteudo-video"></video>` : ''}
+                <div class="result-btns"><button type="button" class="btn-assistir btn-open-project" data-project-id="${escaparHtml(projeto.project_id)}">Abrir projeto</button></div>
+            </article>
+        `;
+    }).join('');
+}
+
+function renderCortesProjeto(projectId) {
+    const projeto = window.projetosConteudo.find(p => p.project_id === projectId);
+    if (!projeto) return;
+    window.projetoAtualId = projectId;
+    conteudosLista.innerHTML = `<div class="result-btns"><button type="button" class="btn-secondary-lite" id="btn-voltar-projetos">← Voltar para projetos</button></div>` + projeto.clips.map((corte) => {
         const titulo = escaparHtml(corte.titulo || 'Sem título');
         const dataFmt = formatarDataPtBR(corte.criado_em);
         const urlVideo = montarUrlVideo(corte.video_url);
@@ -646,10 +689,39 @@ function renderConteudos(cortes) {
                     <a href="${urlVideo}" target="_blank" rel="noopener noreferrer" class="btn-assistir">Abrir vídeo</a>
                     <button type="button" class="btn-download btn-download-video" data-url="${urlVideo}">Baixar</button>
                     <button type="button" class="btn-excluir-corte" data-corte-id="${corteId}">Excluir</button>
+                    <button type="button" class="btn-secondary-lite btn-editar-corte" data-corte-id="${corteId}" data-url="${urlVideo}">Editar</button>
                 </div>
             </article>
         `;
     }).join('');
+}
+
+function abrirModalEdicao(corteId, urlVideo) {
+    const html = `
+    <div id="edit-modal" style="position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;">
+      <div style="background:#111827;border:1px solid #374151;border-radius:12px;max-width:760px;width:100%;padding:16px;color:#fff;">
+        <h3>Editar clipe</h3>
+        <video id="edit-video" src="${urlVideo}" controls style="width:100%;border-radius:8px;margin:8px 0;"></video>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <input id="edit-start" type="number" min="0" step="0.1" placeholder="Início (s)">
+          <input id="edit-end" type="number" min="0" step="0.1" placeholder="Fim (s)">
+          <label><input id="edit-replace" type="checkbox"> Substituir original</label>
+        </div>
+        <p id="edit-duration">Duração estimada: 0.0s</p>
+        <div class="result-btns"><button id="edit-save" class="btn-download">Aplicar corte</button><button id="edit-close" class="btn-excluir-corte">Fechar</button></div>
+      </div></div>`;
+    document.body.insertAdjacentHTML('beforeend', html);
+    const modal = $('edit-modal'), iStart = $('edit-start'), iEnd = $('edit-end');
+    const calc = () => { const d = Math.max(0, (Number(iEnd.value || 0) - Number(iStart.value || 0))); $('edit-duration').textContent = `Duração estimada: ${d.toFixed(2)}s`; };
+    iStart.addEventListener('input', calc); iEnd.addEventListener('input', calc);
+    $('edit-close').onclick = () => modal.remove();
+    $('edit-save').onclick = async () => {
+        const res = await fetch(`${API}/api/cortes/${corteId}/editar`, { method:'POST', headers:getAuthHeaders({'Content-Type':'application/json'}), body: JSON.stringify({ start:Number(iStart.value), end:Number(iEnd.value), replace_original: $('edit-replace').checked }) });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data?.ok) return alert(data?.detail || 'Falha ao editar clipe.');
+        modal.remove();
+        carregarMeusConteudos();
+    };
 }
 
 async function carregarMeusConteudos() {
@@ -837,6 +909,20 @@ document.addEventListener('click', (event) => {
         excluirCorte(btnExcluir.getAttribute('data-corte-id'), btnExcluir);
         return;
     }
+    const btnOpenProject = event.target.closest('.btn-open-project');
+    if (btnOpenProject) {
+        renderCortesProjeto(btnOpenProject.getAttribute('data-project-id'));
+        return;
+    }
+    if (event.target.id === 'btn-voltar-projetos') {
+        renderListaProjetos();
+        return;
+    }
+    const btnEditar = event.target.closest('.btn-editar-corte');
+    if (btnEditar) {
+        abrirModalEdicao(btnEditar.getAttribute('data-corte-id'), btnEditar.getAttribute('data-url'));
+        return;
+    }
 
     const cb = event.target.closest('.conteudo-select');
     if (cb) {
@@ -844,5 +930,37 @@ document.addEventListener('click', (event) => {
         if (cb.checked) window.selectedCortes.add(id);
         else window.selectedCortes.delete(id);
         atualizarContadorSelecao();
+    }
+});
+
+
+document.addEventListener('change', (e) => {
+    if (!e.target.classList.contains('preview-select')) return;
+    const idx = Number(e.target.dataset.index);
+    if (e.target.checked) window.previewSelecionados.add(idx); else window.previewSelecionados.delete(idx);
+});
+
+document.addEventListener('click', async (e) => {
+    if (e.target.id !== 'btn-confirmar-cortes') return;
+    const btn = e.target;
+    const projectId = window.ultimoResultado?.project?.project_id;
+    if (!projectId) return alert('Projeto não encontrado para salvar.');
+    const selected = [...document.querySelectorAll('.preview-select:checked')].map(x => Number(x.dataset.index));
+    if (!selected.length) return alert('Selecione ao menos um corte.');
+    btn.disabled = true; btn.textContent = 'Salvando cortes selecionados...';
+    msg('Salvando cortes selecionados...', '#f97316');
+    try {
+        const res = await fetch(`${API}/api/projetos/${projectId}/confirmar-cortes`, {
+            method: 'POST',
+            headers: getAuthHeaders({'Content-Type':'application/json'}),
+            body: JSON.stringify({ selected_indexes: selected }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Erro ao salvar cortes.');
+        msg('Cortes salvos com sucesso.', '#22c55e');
+        btn.textContent = 'Cortes salvos';
+    } catch(err){
+        msg(`Erro ao gerar/salvar: ${err.message || 'falha'}`, '#ef4444');
+        btn.disabled = false; btn.textContent = 'Salvar cortes selecionados';
     }
 });
