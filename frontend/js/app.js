@@ -175,7 +175,7 @@ window.selecionarEnginePreset = function (card) {
 
 // ── AUTH HELPERS ─────────────────────────────────────────────
 function getAuthToken() {
-    return localStorage.getItem('editmind_token') || window.Auth?.getToken?.() || null;
+    return localStorage.getItem(window.CONFIG?.TOKEN_KEY || 'editmind_token') || window.Auth?.getToken?.() || null;
 }
 
 function getAuthHeaders(extra = {}) {
@@ -646,20 +646,41 @@ function renderConteudos(cortes) {
     renderListaProjetos();
 }
 
+function renderProjetos(projetos) {
+    if (!conteudosLista) return;
+    const lista = Array.isArray(projetos) ? projetos : [];
+    window.projetosConteudo = lista.map((p) => ({
+        ...p,
+        project_id: p.project_id || p.id || 'sem-projeto',
+        clips: Array.isArray(p.cuts) ? p.cuts : (Array.isArray(p.clips) ? p.clips : []),
+    }));
+    window.meusCortes = window.projetosConteudo.flatMap(p => p.clips || []);
+    if (!window.projetosConteudo.length) {
+        renderEmptyStateConteudos();
+        limparSelecaoCortes();
+        return;
+    }
+    limparSelecaoCortes();
+    renderListaProjetos();
+}
+
 function renderListaProjetos() {
     if (!conteudosLista) return;
+    window.projetoAtualId = null;
     if (!window.projetosConteudo.length) return renderEmptyStateConteudos();
     conteudosLista.innerHTML = window.projetosConteudo.map((projeto) => {
         const primeiro = projeto.clips[0] || {};
-        const titulo = escaparHtml(primeiro.titulo || `Projeto ${projeto.project_id}`);
-        const dataFmt = formatarDataPtBR(primeiro.criado_em);
-        const status = primeiro.status || 'concluído';
-        const preview = montarUrlVideo(primeiro.video_url || '');
+        const titulo = escaparHtml(projeto.original_title || primeiro.titulo || `Projeto ${projeto.project_id}`);
+        const dataFmt = formatarDataPtBR(projeto.created_at || primeiro.criado_em);
+        const status = projeto.status || primeiro.status || 'concluido';
+        const preview = montarUrlVideo(projeto.thumbnail_url || primeiro.video_url || '');
+        const totalClips = Number(projeto.clips_count ?? projeto.clips?.length ?? 0);
+        const duracao = projeto.duration_seconds ? `${Number(projeto.duration_seconds).toFixed(1)}s` : 'indisponivel';
         return `
             <article class="tool-bentoCard conteudo-card">
                 <h3 class="tool-title conteudo-title">${titulo}</h3>
                 <p class="tool-description conteudo-date">Criado em: ${dataFmt}</p>
-                <p class="conteudo-tags">Clipes: <b>${projeto.clips.length}</b> · Status: <b>${escaparHtml(status)}</b></p>
+                <p class="conteudo-tags">Clipes: <b>${totalClips}</b> &middot; Duração: <b>${escaparHtml(duracao)}</b> &middot; Status: <b>${escaparHtml(status)}</b></p>
                 ${preview ? `<video src="${preview}" controls preload="metadata" class="conteudo-video"></video>` : ''}
                 <div class="result-btns"><button type="button" class="btn-assistir btn-open-project" data-project-id="${escaparHtml(projeto.project_id)}">Abrir projeto</button></div>
             </article>
@@ -667,10 +688,28 @@ function renderListaProjetos() {
     }).join('');
 }
 
-function renderCortesProjeto(projectId) {
-    const projeto = window.projetosConteudo.find(p => p.project_id === projectId);
+async function renderCortesProjeto(projectId) {
+    let projeto = window.projetosConteudo.find(p => p.project_id === projectId);
+    try {
+        const res = await fetch(`${API}/api/projetos/${encodeURIComponent(projectId)}`, { headers: getAuthHeaders() });
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 401) { window.Auth.logout(); return; }
+        if (res.ok && data?.sucesso && data.projeto) {
+            projeto = {
+                ...data.projeto,
+                project_id: data.projeto.project_id || projectId,
+                clips: Array.isArray(data.projeto.cuts) ? data.projeto.cuts : [],
+            };
+            const idx = window.projetosConteudo.findIndex(p => p.project_id === projectId);
+            if (idx >= 0) window.projetosConteudo[idx] = projeto;
+        }
+    } catch (err) {
+        console.warn('[EditMind] Fallback para projeto em memória:', err);
+    }
     if (!projeto) return;
     window.projetoAtualId = projectId;
+    window.meusCortes = projeto.clips || [];
+    limparSelecaoCortes();
     conteudosLista.innerHTML = `<div class="result-btns"><button type="button" class="btn-secondary-lite" id="btn-voltar-projetos">← Voltar para projetos</button></div>` + projeto.clips.map((corte) => {
         const titulo = escaparHtml(corte.titulo || 'Sem título');
         const dataFmt = formatarDataPtBR(corte.criado_em);
@@ -705,22 +744,41 @@ function abrirModalEdicao(corteId, urlVideo) {
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
           <input id="edit-start" type="number" min="0" step="0.1" placeholder="Início (s)">
           <input id="edit-end" type="number" min="0" step="0.1" placeholder="Fim (s)">
-          <label><input id="edit-replace" type="checkbox"> Substituir original</label>
+          <input id="edit-remove-start" type="number" min="0" step="0.1" placeholder="Remover de (s)">
+          <input id="edit-remove-end" type="number" min="0" step="0.1" placeholder="Remover até (s)">
         </div>
         <p id="edit-duration">Duração estimada: 0.0s</p>
-        <div class="result-btns"><button id="edit-save" class="btn-download">Aplicar corte</button><button id="edit-close" class="btn-excluir-corte">Fechar</button></div>
+        <div class="result-btns"><button id="edit-save" class="btn-download">Salvar nova versão</button><button id="edit-close" class="btn-excluir-corte">Fechar</button></div>
       </div></div>`;
     document.body.insertAdjacentHTML('beforeend', html);
-    const modal = $('edit-modal'), iStart = $('edit-start'), iEnd = $('edit-end');
-    const calc = () => { const d = Math.max(0, (Number(iEnd.value || 0) - Number(iStart.value || 0))); $('edit-duration').textContent = `Duração estimada: ${d.toFixed(2)}s`; };
-    iStart.addEventListener('input', calc); iEnd.addEventListener('input', calc);
+    const modal = $('edit-modal'), video = $('edit-video'), iStart = $('edit-start'), iEnd = $('edit-end');
+    const iRemoveStart = $('edit-remove-start'), iRemoveEnd = $('edit-remove-end');
+    const calc = () => {
+        let d = Math.max(0, (Number(iEnd.value || 0) - Number(iStart.value || 0)));
+        const rs = iRemoveStart.value === '' ? null : Number(iRemoveStart.value);
+        const re = iRemoveEnd.value === '' ? null : Number(iRemoveEnd.value);
+        if (rs !== null && re !== null && re > rs) d = Math.max(0, d - (re - rs));
+        $('edit-duration').textContent = `Duração estimada: ${d.toFixed(2)}s`;
+    };
+    video.addEventListener('loadedmetadata', () => {
+        iStart.value = '0';
+        if (Number.isFinite(video.duration)) iEnd.value = video.duration.toFixed(1);
+        calc();
+    });
+    [iStart, iEnd, iRemoveStart, iRemoveEnd].forEach(input => input.addEventListener('input', calc));
     $('edit-close').onclick = () => modal.remove();
     $('edit-save').onclick = async () => {
-        const res = await fetch(`${API}/api/cortes/${corteId}/editar`, { method:'POST', headers:getAuthHeaders({'Content-Type':'application/json'}), body: JSON.stringify({ start:Number(iStart.value), end:Number(iEnd.value), replace_original: $('edit-replace').checked }) });
+        const payload = { start: Number(iStart.value), end: Number(iEnd.value), replace_original: false };
+        if (iRemoveStart.value !== '' && iRemoveEnd.value !== '') {
+            payload.remove_start = Number(iRemoveStart.value);
+            payload.remove_end = Number(iRemoveEnd.value);
+        }
+        const res = await fetch(`${API}/api/cortes/${corteId}/editar`, { method:'POST', headers:getAuthHeaders({'Content-Type':'application/json'}), body: JSON.stringify(payload) });
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !data?.ok) return alert(data?.detail || 'Falha ao editar clipe.');
         modal.remove();
-        carregarMeusConteudos();
+        if (window.projetoAtualId) renderCortesProjeto(window.projetoAtualId);
+        else carregarMeusConteudos();
     };
 }
 
@@ -729,15 +787,24 @@ async function carregarMeusConteudos() {
     if (!token) { window.Auth.logout(); return; }
     try {
         setConteudosFeedback('');
-        const res = await fetch(`${API}/api/meus-cortes`, { method: 'GET', headers: getAuthHeaders() });
+        const res = await fetch(`${API}/api/projetos`, { method: 'GET', headers: getAuthHeaders() });
         if (res.status === 401) { window.Auth.logout(); return; }
         const dados = await res.json();
         if (!res.ok || !dados?.sucesso) throw new Error(dados?.detail || 'Falha ao carregar conteúdos.');
-        renderConteudos(Array.isArray(dados.cortes) ? dados.cortes : []);
+        renderProjetos(Array.isArray(dados.projetos) ? dados.projetos : []);
     } catch (err) {
-        console.error('[EditMind] Erro ao carregar Meus Conteúdos:', err);
-        setConteudosFeedback(err.message || 'Falha ao carregar conteúdos.');
-        renderEmptyStateConteudos();
+        console.warn('[EditMind] Falha ao carregar projetos; tentando histórico legado:', err);
+        try {
+            const legado = await fetch(`${API}/api/meus-cortes`, { method: 'GET', headers: getAuthHeaders() });
+            if (legado.status === 401) { window.Auth.logout(); return; }
+            const dadosLegado = await legado.json();
+            if (!legado.ok || !dadosLegado?.sucesso) throw new Error(dadosLegado?.detail || 'Falha ao carregar conteúdos.');
+            renderConteudos(Array.isArray(dadosLegado.cortes) ? dadosLegado.cortes : []);
+        } catch (fallbackErr) {
+            console.error('[EditMind] Erro ao carregar Meus Conteúdos:', fallbackErr);
+            setConteudosFeedback(fallbackErr.message || 'Falha ao carregar conteúdos.');
+            renderEmptyStateConteudos();
+        }
     }
 }
 
@@ -756,7 +823,8 @@ async function excluirCorte(corteId, btn) {
         window.meusCortes = window.meusCortes.filter(c => c.id !== corteId);
         document.querySelector(`.conteudo-card[data-corte-id="${corteId}"]`)?.remove();
         setConteudosFeedback('Recorte excluído com sucesso.', 'ok');
-        if (window.meusCortes.length === 0) renderEmptyStateConteudos();
+        if (window.projetoAtualId) await renderCortesProjeto(window.projetoAtualId);
+        else if (window.meusCortes.length === 0) renderEmptyStateConteudos();
     } catch (err) {
         console.error(`[EditMind] Erro ao excluir recorte ${corteId}:`, err);
         setConteudosFeedback(err.message || 'Falha ao excluir recorte.');
@@ -843,8 +911,11 @@ function atualizarContadorSelecao() {
 }
 
 function selecionarTodosCortes() {
-    window.meusCortes.forEach(c => { if (c.id) window.selectedCortes.add(c.id); });
-    document.querySelectorAll('.conteudo-select').forEach(cb => { cb.checked = true; });
+    document.querySelectorAll('.conteudo-select').forEach(cb => {
+        cb.checked = true;
+        const id = cb.getAttribute('data-corte-id');
+        if (id) window.selectedCortes.add(id);
+    });
     atualizarContadorSelecao();
 }
 
@@ -884,7 +955,8 @@ async function excluirSelecionados() {
     ids.forEach(id => document.querySelector(`.conteudo-card[data-corte-id="${id}"]`)?.remove());
     limparSelecaoCortes();
     setConteudosFeedback(`${data.excluidos || ids.size} recorte(s) excluído(s).`, 'ok');
-    if (!window.meusCortes.length) renderEmptyStateConteudos();
+    if (window.projetoAtualId) await renderCortesProjeto(window.projetoAtualId);
+    else if (!window.meusCortes.length) renderEmptyStateConteudos();
 }
 
 // ── EVENT DELEGATION ─────────────────────────────────────────
@@ -959,6 +1031,7 @@ document.addEventListener('click', async (e) => {
         if (!res.ok) throw new Error(data.detail || 'Erro ao salvar cortes.');
         msg('Cortes salvos com sucesso.', '#22c55e');
         btn.textContent = 'Cortes salvos';
+        carregarMeusConteudos();
     } catch(err){
         msg(`Erro ao gerar/salvar: ${err.message || 'falha'}`, '#ef4444');
         btn.disabled = false; btn.textContent = 'Salvar cortes selecionados';

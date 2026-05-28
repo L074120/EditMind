@@ -25,6 +25,7 @@ import logging
 import zipfile
 from pathlib import Path
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional, Any
 from urllib.parse import urlparse, unquote
 
@@ -481,6 +482,65 @@ async def cortar_video(entrada: str, saida: str, inicio: float, fim: float, form
         )
 
 
+async def renderizar_edicao_video(
+    entrada: str,
+    saida: str,
+    inicio: float,
+    fim: float,
+    remove_inicio: Optional[float] = None,
+    remove_fim: Optional[float] = None,
+) -> None:
+    if remove_inicio is None and remove_fim is None:
+        await _ffmpeg(
+            "-y", "-ss", f"{inicio:.3f}", "-to", f"{fim:.3f}", "-i", entrada,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+            "-movflags", "+faststart",
+            saida,
+        )
+        return
+
+    if remove_inicio is None or remove_fim is None:
+        raise HTTPException(400, "Informe remove_start e remove_end juntos.")
+    if not (inicio < remove_inicio < remove_fim < fim):
+        raise HTTPException(400, "O trecho removido deve ficar dentro do intervalo start/end.")
+
+    tmp = Path(tempfile.mkdtemp(prefix="editmind_edit_parts_"))
+    try:
+        parts: list[Path] = []
+
+        async def _part(idx: int, a: float, b: float) -> None:
+            if b - a < 0.25:
+                return
+            part_path = tmp / f"part_{idx}.mp4"
+            await _ffmpeg(
+                "-y", "-ss", f"{a:.3f}", "-to", f"{b:.3f}", "-i", entrada,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+                "-movflags", "+faststart",
+                str(part_path),
+            )
+            parts.append(part_path)
+
+        await _part(1, inicio, remove_inicio)
+        await _part(2, remove_fim, fim)
+        if not parts:
+            raise HTTPException(400, "O trecho removido eliminaria todo o clipe.")
+
+        concat_file = tmp / "concat.txt"
+        concat_file.write_text(
+            "".join(f"file '{p.resolve().as_posix()}'\n" for p in parts),
+            encoding="utf-8",
+        )
+        await _ffmpeg(
+            "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file),
+            "-c", "copy", "-movflags", "+faststart",
+            saida,
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def ts(s: float) -> str:
     s = max(0, int(s))
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
@@ -488,6 +548,36 @@ def ts(s: float) -> str:
 
 def sanitizar(nome: str) -> str:
     return re.sub(r"[^\w.\-]", "_", Path(nome).name)[:100]
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _safe_project_id(project_id: str) -> str:
+    valor = str(project_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", valor):
+        raise HTTPException(400, "project_id invalido.")
+    return valor
+
+
+def _storage_object_name(user_id: str, project_id: str, filename: str) -> str:
+    user_part = re.sub(r"[^A-Za-z0-9_-]", "_", str(user_id or "anon"))[:80]
+    project_part = _safe_project_id(project_id)
+    return f"{user_part}/{project_part}/{sanitizar(filename)}"
+
+
+def _corte_duration(corte: Optional[dict]) -> Optional[float]:
+    if not corte:
+        return None
+    inicio = corte.get("inicio")
+    fim = corte.get("fim")
+    try:
+        if inicio is None or fim is None:
+            return None
+        return round(max(0.0, float(fim) - float(inicio)), 2)
+    except Exception:
+        return None
 
 
 def parse_bool(v: Any) -> bool:
@@ -766,6 +856,10 @@ async def upload_storage(caminho_local: str, nome_arquivo: str) -> Optional[str]
         logger.warning("SUPABASE_SERVICE_KEY não configurada — Storage desativado, usando fallback local.")
         return None
 
+    nome_arquivo = str(nome_arquivo or "").replace("\\", "/").lstrip("/")
+    if not nome_arquivo:
+        raise ValueError("nome_arquivo e obrigatorio para upload no Storage.")
+
     try:
         with open(caminho_local, "rb") as f:
             dados = f.read()
@@ -792,7 +886,59 @@ async def upload_storage(caminho_local: str, nome_arquivo: str) -> Optional[str]
         return None
 
 
+async def _signed_storage_url(nome_arquivo: str, expires_in: int = 3600) -> Optional[str]:
+    if not supabase_admin or not nome_arquivo:
+        return None
+    nome_arquivo = nome_arquivo.replace("\\", "/").lstrip("/")
+    try:
+        resp = await asyncio.to_thread(
+            lambda: supabase_admin.storage.from_(STORAGE_BUCKET).create_signed_url(nome_arquivo, expires_in)
+        )
+        signed = None
+        if isinstance(resp, str):
+            signed = resp
+        elif isinstance(resp, dict):
+            signed = (
+                resp.get("signedURL")
+                or resp.get("signedUrl")
+                or resp.get("signed_url")
+                or (resp.get("data") or {}).get("signedURL")
+                or (resp.get("data") or {}).get("signedUrl")
+            )
+        if signed and signed.startswith("/") and SUPABASE_URL:
+            signed = f"{SUPABASE_URL.rstrip('/')}{signed}"
+        return signed
+    except Exception as e:
+        logger.warning(f"Falha ao criar URL assinada do Storage; tentando URL publica. Erro: {e}")
+        try:
+            resp = await asyncio.to_thread(
+                lambda: supabase_admin.storage.from_(STORAGE_BUCKET).get_public_url(nome_arquivo)
+            )
+            if isinstance(resp, str):
+                return resp
+            return (
+                resp.get("publicUrl")
+                or resp.get("public_url")
+                or (resp.get("data") or {}).get("publicUrl")
+            )
+        except Exception as e2:
+            logger.warning(f"Falha ao obter URL publica do Storage: {e2}")
+            return None
+
+
+async def _baixar_storage_para_arquivo(nome_arquivo: str, destino: Path) -> None:
+    url = await _signed_storage_url(nome_arquivo, expires_in=300)
+    if not url:
+        raise RuntimeError("Nao foi possivel criar URL de leitura do Storage.")
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        resp = await client.get(url)
+        if resp.status_code >= 400:
+            raise RuntimeError("Falha ao baixar arquivo do Storage.")
+        destino.write_bytes(resp.content)
+
+
 async def salvar_registro_corte(
+    user_id: Optional[str],
     user_email: str,
     video_url: str,
     titulo: str,
@@ -800,16 +946,19 @@ async def salvar_registro_corte(
     formato_vertical: bool = False,
     project_id: Optional[str] = None,
     parent_corte_id: Optional[str] = None,
+    original_clip_id: Optional[str] = None,
     is_edited: bool = False,
+    storage_path: Optional[str] = None,
 ) -> Optional[dict]:
-    if not user_email:
-        raise ValueError("user_email é obrigatório para salvar o corte.")
+    if not user_id and not user_email:
+        raise ValueError("user_id ou user_email e obrigatorio para salvar o corte.")
     if not supabase_admin:
         logger.warning("SUPABASE_SERVICE_KEY não configurada — registro do corte não foi salvo no banco.")
         return None
 
     corte = corte or {}
     payload = {
+        "user_id": user_id,
         "user_email": user_email,
         "video_url": video_url,
         "titulo": titulo,
@@ -820,7 +969,10 @@ async def salvar_registro_corte(
         "formato_vertical": formato_vertical,
         "project_id": project_id,
         "parent_corte_id": parent_corte_id,
+        "original_clip_id": original_clip_id or parent_corte_id,
         "is_edited": is_edited,
+        "storage_path": storage_path,
+        "duracao_segundos": _corte_duration(corte),
     }
     payload_limpo = {k: v for k, v in payload.items() if v is not None}
     payload_basico = {"user_email": user_email, "video_url": video_url, "titulo": titulo}
@@ -843,14 +995,24 @@ def _extrair_objeto_storage(video_url: str) -> Optional[str]:
     if not video_url:
         return None
 
-    padroes = ("/storage/v1/object/public/cortes/", "/storage/v1/object/cortes/")
-    for padrao in padroes:
-        if padrao in video_url:
-            return unquote(video_url.split(padrao, 1)[1]).lstrip("/")
+    valor = video_url.strip()
+    if valor.startswith("storage:"):
+        return valor.removeprefix("storage:").lstrip("/")
 
-    parsed = urlparse(video_url)
+    padroes = (
+        "/storage/v1/object/public/cortes/",
+        "/storage/v1/object/sign/cortes/",
+        "/storage/v1/object/cortes/",
+    )
+    for padrao in padroes:
+        if padrao in valor:
+            return unquote(valor.split(padrao, 1)[1].split("?", 1)[0]).lstrip("/")
+
+    parsed = urlparse(valor)
     if parsed.path.startswith("/storage/v1/object/public/cortes/"):
         return unquote(parsed.path.replace("/storage/v1/object/public/cortes/", "", 1)).lstrip("/")
+    if parsed.path.startswith("/storage/v1/object/sign/cortes/"):
+        return unquote(parsed.path.replace("/storage/v1/object/sign/cortes/", "", 1)).lstrip("/")
     if parsed.path.startswith("/storage/v1/object/cortes/"):
         return unquote(parsed.path.replace("/storage/v1/object/cortes/", "", 1)).lstrip("/")
     return None
@@ -860,6 +1022,8 @@ def _normalizar_video_url(video_url: str) -> str:
     if not video_url:
         return ""
     valor = video_url.strip()
+    if valor.startswith("storage:"):
+        return valor
     if valor.startswith("/outputs/"):
         return valor
     objeto = _extrair_objeto_storage(valor)
@@ -869,6 +1033,30 @@ def _normalizar_video_url(video_url: str) -> str:
     if parsed.path.startswith("/outputs/"):
         return parsed.path
     return valor
+
+
+async def _normalizar_corte_saida(corte: dict) -> dict:
+    saida = dict(corte or {})
+    storage_path = saida.get("storage_path") or _extrair_objeto_storage(str(saida.get("video_url") or ""))
+    if storage_path:
+        signed = await _signed_storage_url(storage_path)
+        if signed:
+            saida["video_url"] = signed
+            saida["url"] = signed
+        saida["storage_path"] = storage_path
+    return saida
+
+
+async def _normalizar_cortes_saida(cortes: list[dict]) -> list[dict]:
+    return [await _normalizar_corte_saida(corte) for corte in (cortes or [])]
+
+
+def _filtrar_por_usuario(query, usuario: dict):
+    user_id = usuario.get("id")
+    user_email = usuario.get("email")
+    if user_id:
+        return query.eq("user_id", user_id)
+    return query.eq("user_email", user_email)
 
 
 async def _remover_arquivo_corte(video_url: str) -> None:
@@ -1029,6 +1217,7 @@ async def _salvar_cortes_do_resultado(usuario: dict, titulo_base: str, resultado
     for corte in resultado.get("cortes", []):
         titulo = titulo_base if len(resultado.get("cortes", [])) == 1 else f"{titulo_base} · Recorte {corte.get('index')}"
         registro = await salvar_registro_corte(
+            user_id=usuario.get("id"),
             user_email=user_email,
             video_url=corte.get("url_corte", ""),
             titulo=titulo,
@@ -1041,6 +1230,7 @@ async def _salvar_cortes_do_resultado(usuario: dict, titulo_base: str, resultado
 
 
 def _project_file(project_id: str) -> Path:
+    project_id = _safe_project_id(project_id)
     return OUTPUT_PROJECTS_DIR / project_id / "original_info.json"
 
 
@@ -1052,27 +1242,151 @@ def _load_project(project_id: str) -> dict:
 
 
 def _save_project(project: dict) -> None:
-    project_id = str(project.get("project_id") or "").strip()
-    if not project_id:
-        raise HTTPException(400, "project_id inválido")
+    project_id = _safe_project_id(str(project.get("project_id") or ""))
     base = OUTPUT_PROJECTS_DIR / project_id
     (base / "cuts").mkdir(parents=True, exist_ok=True)
     project["project_path"] = f"/outputs/projects/{project_id}"
     (_project_file(project_id)).write_text(json.dumps(project, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _create_project(original_name: str, source: str, owner: str) -> dict:
+def _create_project(original_name: str, source: str, usuario: dict) -> dict:
     project_id = str(uuid.uuid4())[:8]
+    user_id = usuario.get("id")
+    user_email = usuario.get("email") or ""
     data = {
         "project_id": project_id,
         "original_title": original_name,
         "source": source,
-        "created_at": __import__('datetime').datetime.utcnow().isoformat() + "Z",
-        "owner": owner,
+        "created_at": utc_now_iso(),
+        "owner": user_id or user_email,
+        "user_id": user_id,
+        "user_email": user_email,
+        "status": "preview_pronto",
         "cuts": [],
+        "preview_cuts": [],
     }
     _save_project(data)
     return data
+
+
+async def _salvar_projeto_no_banco(projeto: dict) -> None:
+    if not supabase_admin or not projeto.get("user_id"):
+        return
+    payload = {
+        "id": projeto.get("project_id"),
+        "user_id": projeto.get("user_id"),
+        "user_email": projeto.get("user_email"),
+        "titulo_original": projeto.get("original_title"),
+        "source": projeto.get("source"),
+        "status": projeto.get("status") or "preview_pronto",
+        "thumbnail_url": projeto.get("thumbnail_url"),
+        "duration_seconds": projeto.get("duration_seconds"),
+        "criado_em": projeto.get("created_at"),
+    }
+    payload = {k: v for k, v in payload.items() if v is not None}
+    try:
+        await asyncio.to_thread(
+            lambda: supabase_admin.table("projetos").upsert(payload, on_conflict="id").execute()
+        )
+    except Exception as e:
+        logger.warning(f"Projeto nao registrado no banco (tabela ausente ou schema antigo): {e}")
+
+
+def _projeto_db_para_api(row: dict, cuts: Optional[list[dict]] = None) -> dict:
+    cuts = cuts or []
+    return {
+        "project_id": row.get("id") or row.get("project_id"),
+        "original_title": row.get("titulo_original") or row.get("original_title") or "Projeto sem titulo",
+        "source": row.get("source") or "upload",
+        "created_at": row.get("criado_em") or row.get("created_at"),
+        "status": row.get("status") or ("concluido" if cuts else "processado"),
+        "thumbnail_url": row.get("thumbnail_url") or ((cuts[0] or {}).get("video_url") if cuts else None),
+        "duration_seconds": row.get("duration_seconds"),
+        "clips_count": len(cuts),
+        "cuts": cuts,
+    }
+
+
+async def _listar_projetos_banco(usuario: dict) -> Optional[list[dict]]:
+    if not supabase_admin or not usuario.get("id"):
+        return None
+    try:
+        projetos_resp = await asyncio.to_thread(
+            lambda: supabase_admin.table("projetos")
+            .select("*")
+            .eq("user_id", usuario.get("id"))
+            .order("criado_em", desc=True)
+            .execute()
+        )
+        cortes_resp = await asyncio.to_thread(
+            lambda: supabase_admin.table("cortes")
+            .select("*")
+            .eq("user_id", usuario.get("id"))
+            .order("criado_em", desc=True)
+            .execute()
+        )
+    except Exception as e:
+        logger.warning(f"Listagem de projetos via banco indisponivel, usando fallback local: {e}")
+        return None
+
+    cortes = await _normalizar_cortes_saida(cortes_resp.data or [])
+    por_projeto: dict[str, list[dict]] = {}
+    for corte in cortes:
+        pid = corte.get("project_id") or "sem-projeto"
+        por_projeto.setdefault(pid, []).append(corte)
+
+    projetos = []
+    for row in projetos_resp.data or []:
+        pid = row.get("id")
+        projetos.append(_projeto_db_para_api(row, por_projeto.get(pid, [])))
+
+    ids_com_projeto = {p.get("project_id") for p in projetos}
+    for pid, cuts in por_projeto.items():
+        if pid and pid not in ids_com_projeto:
+            projetos.append(_projeto_db_para_api({"id": pid, "titulo_original": cuts[0].get("titulo")}, cuts))
+
+    projetos.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    return projetos
+
+
+async def _detalhar_projeto_banco(project_id: str, usuario: dict) -> Optional[dict]:
+    if not supabase_admin or not usuario.get("id"):
+        return None
+    try:
+        projeto_resp = await asyncio.to_thread(
+            lambda: supabase_admin.table("projetos")
+            .select("*")
+            .eq("id", project_id)
+            .eq("user_id", usuario.get("id"))
+            .limit(1)
+            .execute()
+        )
+        projeto = (projeto_resp.data or [None])[0]
+        if not projeto:
+            return None
+        cortes_resp = await asyncio.to_thread(
+            lambda: supabase_admin.table("cortes")
+            .select("*")
+            .eq("project_id", project_id)
+            .eq("user_id", usuario.get("id"))
+            .order("criado_em", desc=True)
+            .execute()
+        )
+        cortes = await _normalizar_cortes_saida(cortes_resp.data or [])
+        return _projeto_db_para_api(projeto, cortes)
+    except Exception as e:
+        logger.warning(f"Detalhe de projeto via banco indisponivel, usando fallback local: {e}")
+        return None
+
+
+def _usuario_eh_dono_projeto(projeto: dict, usuario: dict) -> bool:
+    user_id = usuario.get("id")
+    user_email = usuario.get("email")
+    return (
+        (user_id and projeto.get("user_id") == user_id)
+        or (user_email and projeto.get("user_email") == user_email)
+        or projeto.get("owner") in {user_id, user_email}
+    )
 
 
 
@@ -1213,8 +1527,13 @@ async def processar_video(
                     raise HTTPException(413, f"Arquivo muito grande. Máx {MAX_BYTES // 1024 // 1024}MB.")
                 f_out.write(chunk)
 
-        projeto = _create_project(file.filename or f"upload_{job_id}", "upload", usuario.get("email") or usuario.get("id") or "anon")
+        projeto = _create_project(file.filename or f"upload_{job_id}", "upload", usuario)
         resultado = await _pipeline(str(video_path), job_id, tasks, pasta_temp, config, projeto["project_id"], persist=False)
+        projeto["duration_seconds"] = float((resultado.get("detalhes_tecnicos") or {}).get("duracao_segundos") or 0)
+        projeto["preview_cuts"] = resultado.get("cortes", [])
+        projeto["thumbnail_url"] = (resultado.get("cortes") or [{}])[0].get("url_corte")
+        _save_project(projeto)
+        await _salvar_projeto_no_banco(projeto)
         resultado["project"] = projeto
         resultado["status"] = "preview_pronto"
         return JSONResponse(resultado)
@@ -1239,8 +1558,13 @@ async def processar_link(tasks: BackgroundTasks, dados: LinkRequest, usuario: di
         video_normalizado = str(pasta_temp / "video_browser.mp4")
         await normalizar_video_para_browser(video_path, video_normalizado, forcar_reencode=eh_tiktok_url(dados.url))
         origem = "youtube" if eh_youtube_url(dados.url) else ("tiktok" if eh_tiktok_url(dados.url) else "link")
-        projeto = _create_project(dados.url, origem, usuario.get("email") or usuario.get("id") or "anon")
+        projeto = _create_project(dados.url, origem, usuario)
         resultado = await _pipeline(video_normalizado, job_id, tasks, pasta_temp, config, projeto["project_id"], persist=False)
+        projeto["duration_seconds"] = float((resultado.get("detalhes_tecnicos") or {}).get("duracao_segundos") or 0)
+        projeto["preview_cuts"] = resultado.get("cortes", [])
+        projeto["thumbnail_url"] = (resultado.get("cortes") or [{}])[0].get("url_corte")
+        _save_project(projeto)
+        await _salvar_projeto_no_banco(projeto)
         resultado["project"] = projeto
         resultado["status"] = "preview_pronto"
         return JSONResponse(resultado)
@@ -1312,19 +1636,28 @@ class ConfirmarCortesRequest(BaseModel):
 class EditarCorteRequest(BaseModel):
     start: float
     end: float
+    remove_start: Optional[float] = None
+    remove_end: Optional[float] = None
     replace_original: bool = False
 
 
 @app.post("/api/projetos/{project_id}/confirmar-cortes")
 async def confirmar_cortes(project_id: str, dados: ConfirmarCortesRequest, usuario: dict = Depends(get_current_user)):
+    project_id = _safe_project_id(project_id)
     projeto = _load_project(project_id)
-    owner = usuario.get("email") or usuario.get("id")
-    if projeto.get("owner") != owner:
+    if not _usuario_eh_dono_projeto(projeto, usuario):
         raise HTTPException(403, "Projeto não pertence ao usuário autenticado.")
     temp_dir = OUTPUT_TEMP_DIR / project_id
     if not temp_dir.exists():
         raise HTTPException(404, "Pré-visualizações temporárias não encontradas.")
     selected = set(int(i) for i in dados.selected_indexes or [])
+    if not selected:
+        raise HTTPException(400, "Selecione ao menos um corte.")
+    preview_por_index = {
+        int(c.get("index", 0)): c
+        for c in (projeto.get("preview_cuts") or [])
+        if str(c.get("index", "")).isdigit()
+    }
     persisted = []
     for path in sorted(temp_dir.glob("*.mp4")):
         m = re.search(r"_(\d+)\.mp4$", path.name)
@@ -1334,24 +1667,68 @@ async def confirmar_cortes(project_id: str, dados: ConfirmarCortesRequest, usuar
         destino = OUTPUT_PROJECTS_DIR / project_id / "cuts" / path.name
         destino.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), str(destino))
-        corte = {"index": idx, "video_url": f"/outputs/projects/{project_id}/cuts/{path.name}", "criado_em": __import__('datetime').datetime.utcnow().isoformat()+"Z"}
-        persisted.append(corte)
+        meta = preview_por_index.get(idx, {})
+        storage_path = None
+        video_url = f"/outputs/projects/{project_id}/cuts/{path.name}"
+        if usuario.get("id"):
+            storage_path = _storage_object_name(usuario["id"], project_id, path.name)
+            url_publica = await upload_storage(str(destino), storage_path)
+            if url_publica:
+                video_url = f"storage:{storage_path}"
+                destino.unlink(missing_ok=True)
+        titulo_base = projeto.get("original_title") or "Video"
+        titulo = titulo_base if len(selected) == 1 else f"{titulo_base} - Recorte {idx}"
+        registro = await salvar_registro_corte(
+            user_id=usuario.get("id"),
+            user_email=usuario.get("email") or "",
+            video_url=video_url,
+            titulo=titulo,
+            corte={
+                "inicio": meta.get("inicio_segundos"),
+                "fim": meta.get("fim_segundos"),
+                "foco": meta.get("foco"),
+                "duracao_tipo": meta.get("duracao_tipo"),
+            },
+            formato_vertical=bool(meta.get("formato_vertical")),
+            project_id=project_id,
+            storage_path=storage_path if video_url.startswith("storage:") else None,
+        )
+        corte = {
+            "id": (registro or {}).get("id"),
+            "index": idx,
+            "video_url": video_url,
+            "storage_path": storage_path if video_url.startswith("storage:") else None,
+            "criado_em": utc_now_iso(),
+            "inicio_segundos": meta.get("inicio_segundos"),
+            "fim_segundos": meta.get("fim_segundos"),
+            "foco": meta.get("foco"),
+            "duracao_tipo": meta.get("duracao_tipo"),
+        }
+        persisted.append(await _normalizar_corte_saida(corte))
         projeto.setdefault("cuts", []).append(corte)
     shutil.rmtree(temp_dir, ignore_errors=True)
+    projeto["status"] = "concluido"
+    projeto["clips_count"] = len(projeto.get("cuts") or [])
+    projeto["thumbnail_url"] = (projeto.get("cuts") or [{}])[0].get("video_url")
     _save_project(projeto)
+    await _salvar_projeto_no_banco(projeto)
     return {"sucesso": True, "project_id": project_id, "saved_cuts": persisted, "project": projeto}
 
 
 @app.get("/api/projetos")
 async def listar_projetos(usuario: dict = Depends(get_current_user)):
-    owner = usuario.get("email") or usuario.get("id")
+    projetos_banco = await _listar_projetos_banco(usuario)
+    if projetos_banco is not None:
+        return {"sucesso": True, "projetos": projetos_banco}
+
     projetos = []
     for meta in OUTPUT_PROJECTS_DIR.glob("*/original_info.json"):
         data = json.loads(meta.read_text(encoding="utf-8"))
-        if data.get("owner") == owner:
+        if _usuario_eh_dono_projeto(data, usuario):
             cuts = data.get("cuts") or []
+            data["cuts"] = await _normalizar_cortes_saida(cuts)
             data["clips_count"] = len(cuts)
-            data["thumbnail_url"] = (cuts[0] or {}).get("video_url") if cuts else None
+            data["thumbnail_url"] = ((data["cuts"][0] or {}).get("video_url") if data["cuts"] else None)
             data["status"] = data.get("status") or ("concluido" if cuts else "processado")
             projetos.append(data)
     projetos.sort(key=lambda x: x.get("created_at", ""), reverse=True)
@@ -1360,13 +1737,18 @@ async def listar_projetos(usuario: dict = Depends(get_current_user)):
 
 @app.get("/api/projetos/{project_id}")
 async def detalhe_projeto(project_id: str, usuario: dict = Depends(get_current_user)):
+    project_id = _safe_project_id(project_id)
+    projeto_banco = await _detalhar_projeto_banco(project_id, usuario)
+    if projeto_banco is not None:
+        return {"sucesso": True, "projeto": projeto_banco}
+
     projeto = _load_project(project_id)
-    owner = usuario.get("email") or usuario.get("id")
-    if projeto.get("owner") != owner:
+    if not _usuario_eh_dono_projeto(projeto, usuario):
         raise HTTPException(403, "Projeto não pertence ao usuário autenticado.")
     cuts = projeto.get("cuts") or []
+    projeto["cuts"] = await _normalizar_cortes_saida(cuts)
     projeto["clips_count"] = len(cuts)
-    projeto["thumbnail_url"] = (cuts[0] or {}).get("video_url") if cuts else None
+    projeto["thumbnail_url"] = ((projeto["cuts"][0] or {}).get("video_url") if projeto["cuts"] else None)
     projeto["status"] = projeto.get("status") or ("concluido" if cuts else "processado")
     return {"sucesso": True, "projeto": projeto}
 
@@ -1379,19 +1761,37 @@ async def detalhe_projeto(project_id: str, usuario: dict = Depends(get_current_u
 async def meus_cortes(usuario: dict = Depends(get_current_user)):
     if not supabase_admin:
         raise HTTPException(503, "Banco indisponível.")
+    user_id = usuario.get("id")
     user_email = usuario.get("email")
-    if not user_email:
-        raise HTTPException(401, "Usuário inválido: email ausente no token.")
+    if not user_id and not user_email:
+        raise HTTPException(401, "Usuário inválido no token.")
     try:
-        resp = await asyncio.to_thread(
-            lambda: supabase_admin.table("cortes")
-            .select("*")
-            .eq("user_email", user_email)
-            .order("criado_em", desc=True)
-            .execute()
-        )
-        cortes = resp.data or []
-        logger.info(f"/api/meus-cortes usuário={user_email} registros={len(cortes)}")
+        try:
+            resp = await asyncio.to_thread(
+                lambda: _filtrar_por_usuario(
+                    supabase_admin.table("cortes").select("*"),
+                    usuario,
+                ).order("criado_em", desc=True).execute()
+            )
+        except Exception as e:
+            logger.warning(f"Filtro por user_id indisponivel; fallback por email: {e}")
+            resp = await asyncio.to_thread(
+                lambda: supabase_admin.table("cortes")
+                .select("*")
+                .eq("user_email", user_email)
+                .order("criado_em", desc=True)
+                .execute()
+            )
+        if not (resp.data or []) and user_id and user_email:
+            resp = await asyncio.to_thread(
+                lambda: supabase_admin.table("cortes")
+                .select("*")
+                .eq("user_email", user_email)
+                .order("criado_em", desc=True)
+                .execute()
+            )
+        cortes = await _normalizar_cortes_saida(resp.data or [])
+        logger.info(f"/api/meus-cortes usuario={user_id or user_email} registros={len(cortes)}")
         return {"sucesso": True, "cortes": cortes}
     except Exception as e:
         logger.error(f"Erro ao buscar cortes do usuário: {e}")
@@ -1402,115 +1802,224 @@ async def meus_cortes(usuario: dict = Depends(get_current_user)):
 async def editar_corte(corte_id: str, dados: EditarCorteRequest, usuario: dict = Depends(get_current_user)):
     if not supabase_admin:
         raise HTTPException(503, "Banco indisponível.")
+    user_id = usuario.get("id")
     user_email = usuario.get("email")
-    if not user_email:
-        raise HTTPException(401, "Usuário inválido: email ausente no token.")
+    if not user_id and not user_email:
+        raise HTTPException(401, "Usuário inválido no token.")
 
     start = float(dados.start)
     end = float(dados.end)
+    remove_start = float(dados.remove_start) if dados.remove_start is not None else None
+    remove_end = float(dados.remove_end) if dados.remove_end is not None else None
     if start < 0:
         raise HTTPException(400, "start deve ser >= 0.")
     if end <= start:
         raise HTTPException(400, "end deve ser maior que start.")
-    if (end - start) < 1.0:
+    duracao_final = end - start
+    if remove_start is not None or remove_end is not None:
+        if remove_start is None or remove_end is None:
+            raise HTTPException(400, "Informe remove_start e remove_end juntos.")
+        if not (start < remove_start < remove_end < end):
+            raise HTTPException(400, "O trecho removido deve ficar dentro de start/end.")
+        duracao_final -= (remove_end - remove_start)
+    if duracao_final < 1.0:
         raise HTTPException(400, "A duração mínima do corte editado é de 1 segundo.")
 
-    busca = await asyncio.to_thread(
-        lambda: supabase_admin.table("cortes")
-        .select("*")
-        .eq("id", corte_id)
-        .eq("user_email", user_email)
-        .limit(1)
-        .execute()
-    )
+    try:
+        busca = await asyncio.to_thread(
+            lambda: _filtrar_por_usuario(
+                supabase_admin.table("cortes").select("*").eq("id", corte_id),
+                usuario,
+            ).limit(1).execute()
+        )
+    except Exception as e:
+        logger.warning(f"Filtro por user_id indisponivel no editor; fallback por email: {e}")
+        busca = await asyncio.to_thread(
+            lambda: supabase_admin.table("cortes")
+            .select("*")
+            .eq("id", corte_id)
+            .eq("user_email", user_email)
+            .limit(1)
+            .execute()
+        )
     corte_original = (busca.data or [None])[0]
+    if not corte_original and user_email and user_id:
+        busca = await asyncio.to_thread(
+            lambda: supabase_admin.table("cortes")
+            .select("*")
+            .eq("id", corte_id)
+            .eq("user_email", user_email)
+            .limit(1)
+            .execute()
+        )
+        corte_original = (busca.data or [None])[0]
     if not corte_original:
         raise HTTPException(404, "Recorte não encontrado.")
 
     original_url = str(corte_original.get("video_url") or "")
-    if not original_url.startswith("/outputs/"):
-        raise HTTPException(400, "Edição suportada apenas para vídeos locais (/outputs) nesta versão.")
-    input_path = Path(original_url.removeprefix("/")).resolve()
-    if not input_path.exists():
-        raise HTTPException(404, "Arquivo de vídeo original não encontrado.")
+    storage_original = corte_original.get("storage_path") or _extrair_objeto_storage(original_url)
+    cleanup_dir: Optional[Path] = None
+    if storage_original:
+        cleanup_dir = Path(tempfile.mkdtemp(prefix="editmind_edit_src_"))
+        input_path = cleanup_dir / "original.mp4"
+        await _baixar_storage_para_arquivo(storage_original, input_path)
+    elif original_url.startswith("/outputs/"):
+        input_path = Path(original_url.removeprefix("/")).resolve()
+        base_outputs = OUTPUT_DIR.resolve()
+        if base_outputs not in input_path.parents or not input_path.exists():
+            raise HTTPException(404, "Arquivo de vídeo original não encontrado.")
+    else:
+        cleanup_dir = Path(tempfile.mkdtemp(prefix="editmind_edit_src_"))
+        input_path = cleanup_dir / "original.mp4"
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            resp = await client.get(original_url)
+            if resp.status_code >= 400:
+                raise HTTPException(502, "Falha ao obter vídeo original para edição.")
+            input_path.write_bytes(resp.content)
 
-    meta = await obter_metadados(str(input_path))
-    duracao_real = float(meta.get("duracao_segundos") or 0)
-    if end > duracao_real:
-        raise HTTPException(400, f"end não pode ultrapassar a duração real ({duracao_real:.2f}s).")
+    try:
+        meta = await obter_metadados(str(input_path))
+        duracao_real = float(meta.get("duracao_segundos") or 0)
+        if end > duracao_real:
+            raise HTTPException(400, f"end não pode ultrapassar a duração real ({duracao_real:.2f}s).")
 
-    output_name = f"{sanitizar(input_path.stem)}_edit_{uuid.uuid4().hex[:8]}.mp4"
-    output_path = input_path.parent / output_name
+        project_id = corte_original.get("project_id") or "sem-projeto"
+        output_name = f"{sanitizar(Path(original_url).stem or 'corte')}_edit_{uuid.uuid4().hex[:8]}.mp4"
+        output_dir = OUTPUT_PROJECTS_DIR / _safe_project_id(project_id) / "cuts"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / output_name
 
-    await _ffmpeg(
-        "-y", "-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(input_path),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k", "-ac", "2",
-        "-movflags", "+faststart",
-        str(output_path),
-    )
+        await renderizar_edicao_video(
+            str(input_path),
+            str(output_path),
+            start,
+            end,
+            remove_start,
+            remove_end,
+        )
 
-    novo_url = f"/{output_path.as_posix()}"
-    project_id = corte_original.get("project_id")
-    novo_corte = await salvar_registro_corte(
-        user_email=user_email,
-        video_url=novo_url,
-        titulo=f"{corte_original.get('titulo') or 'Recorte'} (editado)",
-        corte={"inicio": start, "fim": end, "foco": corte_original.get("foco"), "duracao_tipo": "custom"},
-        formato_vertical=bool(corte_original.get("formato_vertical")),
-        project_id=project_id,
-        parent_corte_id=corte_id,
-        is_edited=True,
-    )
+        storage_path = _storage_object_name(user_id or user_email or "anon", project_id, output_name)
+        novo_url = f"/{output_path.as_posix()}"
+        url_publica = await upload_storage(str(output_path), storage_path)
+        if url_publica:
+            novo_url = f"storage:{storage_path}"
+            output_path.unlink(missing_ok=True)
 
-    if project_id:
-        try:
-            projeto = _load_project(project_id)
-            projeto.setdefault("cuts", []).append({
-                "index": len(projeto.get("cuts") or []) + 1,
-                "video_url": novo_url,
-                "criado_em": __import__("datetime").datetime.utcnow().isoformat() + "Z",
-                "edited_from": corte_id,
-            })
-            _save_project(projeto)
-        except Exception as e:
-            logger.warning(f"Falha ao atualizar projeto na edição ({project_id}): {e}")
+        novo_corte = await salvar_registro_corte(
+            user_id=user_id,
+            user_email=user_email or "",
+            video_url=novo_url,
+            titulo=f"{corte_original.get('titulo') or 'Recorte'} (editado)",
+            corte={"inicio": start, "fim": end, "foco": corte_original.get("foco"), "duracao_tipo": "custom"},
+            formato_vertical=bool(corte_original.get("formato_vertical")),
+            project_id=project_id,
+            parent_corte_id=corte_id,
+            original_clip_id=corte_id,
+            is_edited=True,
+            storage_path=storage_path if novo_url.startswith("storage:") else None,
+        )
 
-    if dados.replace_original:
-        try:
-            await _remover_arquivo_corte(original_url)
-        except Exception as e:
-            logger.warning(f"Falha ao remover arquivo original editado: {e}")
-        await asyncio.to_thread(lambda: supabase_admin.table("cortes").delete().eq("id", corte_id).eq("user_email", user_email).execute())
+        if project_id:
+            try:
+                projeto = _load_project(project_id)
+                if _usuario_eh_dono_projeto(projeto, usuario):
+                    projeto.setdefault("cuts", []).append({
+                        "id": (novo_corte or {}).get("id"),
+                        "index": len(projeto.get("cuts") or []) + 1,
+                        "video_url": novo_url,
+                        "storage_path": storage_path if novo_url.startswith("storage:") else None,
+                        "criado_em": utc_now_iso(),
+                        "edited_from": corte_id,
+                    })
+                    projeto["status"] = "concluido"
+                    _save_project(projeto)
+                    await _salvar_projeto_no_banco(projeto)
+            except Exception as e:
+                logger.warning(f"Falha ao atualizar projeto na edição ({project_id}): {e}")
 
-    return {
-        "ok": True,
-        "corte": {
-            "id": (novo_corte or {}).get("id"),
-            "project_id": project_id,
-            "url": novo_url,
-            "duration": round(end - start, 2),
-        },
-    }
+        if dados.replace_original:
+            try:
+                await _remover_arquivo_corte(storage_original and f"storage:{storage_original}" or original_url)
+            except Exception as e:
+                logger.warning(f"Falha ao remover arquivo original editado: {e}")
+            try:
+                await asyncio.to_thread(
+                    lambda: _filtrar_por_usuario(
+                        supabase_admin.table("cortes").delete().eq("id", corte_id),
+                        usuario,
+                    ).execute()
+                )
+            except Exception:
+                await asyncio.to_thread(
+                    lambda: supabase_admin.table("cortes").delete().eq("id", corte_id).eq("user_email", user_email).execute()
+                )
+
+        saida = await _normalizar_corte_saida(novo_corte or {"video_url": novo_url, "storage_path": storage_path})
+        return {
+            "ok": True,
+            "corte": {
+                "id": (novo_corte or {}).get("id"),
+                "project_id": project_id,
+                "url": saida.get("video_url") or novo_url,
+                "duration": round(duracao_final, 2),
+            },
+        }
+    finally:
+        if cleanup_dir:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
 @app.get("/api/cortes/download")
 async def download_corte(video_url: str, usuario: dict = Depends(get_current_user)):
     if not supabase_admin:
         raise HTTPException(503, "Banco indisponível.")
+    user_id = usuario.get("id")
     user_email = usuario.get("email")
-    if not user_email:
-        raise HTTPException(401, "Usuário inválido: email ausente no token.")
+    if not user_id and not user_email:
+        raise HTTPException(401, "Usuário inválido no token.")
 
-    logger.info(f"GET /api/cortes/download | usuário={user_email} | video_url={video_url}")
+    logger.info(f"GET /api/cortes/download | usuario={user_id or user_email} | video_url={video_url}")
     try:
-        registros = await asyncio.to_thread(
-            lambda: supabase_admin.table("cortes").select("video_url").eq("user_email", user_email).execute()
-        )
+        try:
+            registros = await asyncio.to_thread(
+                lambda: _filtrar_por_usuario(
+                    supabase_admin.table("cortes").select("video_url,storage_path"),
+                    usuario,
+                ).execute()
+            )
+        except Exception as e:
+            logger.warning(f"Filtro por user_id indisponivel no download; fallback por email: {e}")
+            registros = await asyncio.to_thread(
+                lambda: supabase_admin.table("cortes").select("video_url,storage_path").eq("user_email", user_email).execute()
+            )
         alvo = _normalizar_video_url(video_url)
-        urls_usuario = {_normalizar_video_url(c.get("video_url", "")) for c in (registros.data or [])}
+        urls_usuario = {
+            _normalizar_video_url(c.get("video_url", "") or f"storage:{c.get('storage_path')}")
+            for c in (registros.data or [])
+        }
         if alvo not in urls_usuario:
-            raise HTTPException(404, "Vídeo não encontrado para o usuário autenticado.")
+            if user_id and user_email:
+                registros = await asyncio.to_thread(
+                    lambda: supabase_admin.table("cortes").select("video_url,storage_path").eq("user_email", user_email).execute()
+                )
+                urls_usuario = {
+                    _normalizar_video_url(c.get("video_url", "") or f"storage:{c.get('storage_path')}")
+                    for c in (registros.data or [])
+                }
+            if alvo not in urls_usuario:
+                raise HTTPException(404, "Vídeo não encontrado para o usuário autenticado.")
+
+        storage_path = _extrair_objeto_storage(alvo)
+        if storage_path:
+            url_download = await _signed_storage_url(storage_path, expires_in=300)
+            if not url_download:
+                raise HTTPException(502, "Falha ao criar URL de download do Storage.")
+            async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
+                resp = await client.get(url_download)
+                if resp.status_code >= 400:
+                    raise HTTPException(502, "Falha ao obter arquivo no Storage.")
+                content_type = resp.headers.get("content-type", "video/mp4")
+                return StreamingResponse(iter([resp.content]), media_type=content_type, headers={"Content-Disposition": 'attachment; filename="Corte_EditMind.mp4"'})
 
         if alvo.startswith("/outputs/"):
             caminho = Path(alvo.removeprefix("/")).resolve()
@@ -1542,23 +2051,62 @@ async def download_corte(video_url: str, usuario: dict = Depends(get_current_use
 async def excluir_corte(corte_id: str, usuario: dict = Depends(get_current_user)):
     if not supabase_admin:
         raise HTTPException(503, "Banco indisponível.")
+    user_id = usuario.get("id")
     user_email = usuario.get("email")
-    if not user_email:
-        raise HTTPException(401, "Usuário inválido: email ausente no token.")
+    if not user_id and not user_email:
+        raise HTTPException(401, "Usuário inválido no token.")
     try:
-        busca = await asyncio.to_thread(
-            lambda: supabase_admin.table("cortes")
-            .select("id, user_email, video_url")
-            .eq("id", corte_id)
-            .eq("user_email", user_email)
-            .limit(1)
-            .execute()
-        )
+        try:
+            busca = await asyncio.to_thread(
+                lambda: _filtrar_por_usuario(
+                    supabase_admin.table("cortes").select("id,user_id,user_email,video_url,storage_path,project_id").eq("id", corte_id),
+                    usuario,
+                ).limit(1).execute()
+            )
+        except Exception as e:
+            logger.warning(f"Filtro por user_id indisponivel no delete; fallback por email: {e}")
+            busca = await asyncio.to_thread(
+                lambda: supabase_admin.table("cortes")
+                .select("id,user_email,video_url,storage_path,project_id")
+                .eq("id", corte_id)
+                .eq("user_email", user_email)
+                .limit(1)
+                .execute()
+            )
         corte = (busca.data or [None])[0]
+        if not corte and user_email and user_id:
+            busca = await asyncio.to_thread(
+                lambda: supabase_admin.table("cortes")
+                .select("id,user_email,video_url,storage_path,project_id")
+                .eq("id", corte_id)
+                .eq("user_email", user_email)
+                .limit(1)
+                .execute()
+            )
+            corte = (busca.data or [None])[0]
         if not corte:
             raise HTTPException(404, "Recorte não encontrado.")
-        await _remover_arquivo_corte(corte.get("video_url", ""))
-        await asyncio.to_thread(lambda: supabase_admin.table("cortes").delete().eq("id", corte_id).eq("user_email", user_email).execute())
+        await _remover_arquivo_corte(corte.get("storage_path") and f"storage:{corte.get('storage_path')}" or corte.get("video_url", ""))
+        try:
+            await asyncio.to_thread(
+                lambda: _filtrar_por_usuario(
+                    supabase_admin.table("cortes").delete().eq("id", corte_id),
+                    usuario,
+                ).execute()
+            )
+        except Exception:
+            await asyncio.to_thread(
+                lambda: supabase_admin.table("cortes").delete().eq("id", corte_id).eq("user_email", user_email).execute()
+            )
+        project_id = corte.get("project_id")
+        if project_id:
+            try:
+                projeto = _load_project(project_id)
+                if _usuario_eh_dono_projeto(projeto, usuario):
+                    projeto["cuts"] = [c for c in (projeto.get("cuts") or []) if c.get("id") != corte_id]
+                    _save_project(projeto)
+            except Exception:
+                pass
         return {"sucesso": True, "mensagem": "Recorte excluído com sucesso."}
     except HTTPException:
         raise
@@ -1571,31 +2119,58 @@ async def excluir_corte(corte_id: str, usuario: dict = Depends(get_current_user)
 async def excluir_cortes_em_massa(dados: BulkDeleteRequest, usuario: dict = Depends(get_current_user)):
     if not supabase_admin:
         raise HTTPException(503, "Banco indisponível.")
+    user_id = usuario.get("id")
     user_email = usuario.get("email")
-    if not user_email:
+    if not user_id and not user_email:
         raise HTTPException(401, "Usuário inválido.")
 
-    busca = await asyncio.to_thread(
-        lambda: supabase_admin.table("cortes")
-        .select("id,video_url,user_email")
-        .eq("user_email", user_email)
-        .in_("id", dados.ids)
-        .execute()
+    try:
+        busca = await asyncio.to_thread(
+            lambda: _filtrar_por_usuario(
+                supabase_admin.table("cortes").select("id,video_url,storage_path,user_email,project_id").in_("id", dados.ids),
+                usuario,
+            ).execute()
+        )
+    except Exception as e:
+        logger.warning(f"Filtro por user_id indisponivel no bulk delete; fallback por email: {e}")
+        busca = await asyncio.to_thread(
+            lambda: supabase_admin.table("cortes")
+            .select("id,video_url,storage_path,user_email,project_id")
+            .eq("user_email", user_email)
+            .in_("id", dados.ids)
+            .execute()
     )
     registros = busca.data or []
+    if not registros and user_id and user_email:
+        busca = await asyncio.to_thread(
+            lambda: supabase_admin.table("cortes")
+            .select("id,video_url,storage_path,user_email,project_id")
+            .eq("user_email", user_email)
+            .in_("id", dados.ids)
+            .execute()
+        )
+        registros = busca.data or []
     if not registros:
         return {"sucesso": True, "excluidos": 0}
 
     for corte in registros:
         try:
-            await _remover_arquivo_corte(corte.get("video_url", ""))
+            await _remover_arquivo_corte(corte.get("storage_path") and f"storage:{corte.get('storage_path')}" or corte.get("video_url", ""))
         except Exception as e:
             logger.warning(f"Falha ao remover arquivo do corte {corte.get('id')}: {e}")
 
     ids_existentes = [c.get("id") for c in registros if c.get("id")]
-    await asyncio.to_thread(
-        lambda: supabase_admin.table("cortes").delete().eq("user_email", user_email).in_("id", ids_existentes).execute()
-    )
+    try:
+        await asyncio.to_thread(
+            lambda: _filtrar_por_usuario(
+                supabase_admin.table("cortes").delete().in_("id", ids_existentes),
+                usuario,
+            ).execute()
+        )
+    except Exception:
+        await asyncio.to_thread(
+            lambda: supabase_admin.table("cortes").delete().eq("user_email", user_email).in_("id", ids_existentes).execute()
+        )
     return {"sucesso": True, "excluidos": len(ids_existentes)}
 
 
@@ -1603,18 +2178,37 @@ async def excluir_cortes_em_massa(dados: BulkDeleteRequest, usuario: dict = Depe
 async def baixar_cortes_em_massa(dados: BulkDeleteRequest, usuario: dict = Depends(get_current_user)):
     if not supabase_admin:
         raise HTTPException(503, "Banco indisponível.")
+    user_id = usuario.get("id")
     user_email = usuario.get("email")
-    if not user_email:
+    if not user_id and not user_email:
         raise HTTPException(401, "Usuário inválido.")
 
-    busca = await asyncio.to_thread(
-        lambda: supabase_admin.table("cortes")
-        .select("id,titulo,video_url,user_email")
-        .eq("user_email", user_email)
-        .in_("id", dados.ids)
-        .execute()
+    try:
+        busca = await asyncio.to_thread(
+            lambda: _filtrar_por_usuario(
+                supabase_admin.table("cortes").select("id,titulo,video_url,storage_path,user_email").in_("id", dados.ids),
+                usuario,
+            ).execute()
+        )
+    except Exception as e:
+        logger.warning(f"Filtro por user_id indisponivel no bulk download; fallback por email: {e}")
+        busca = await asyncio.to_thread(
+            lambda: supabase_admin.table("cortes")
+            .select("id,titulo,video_url,storage_path,user_email")
+            .eq("user_email", user_email)
+            .in_("id", dados.ids)
+            .execute()
     )
     registros = busca.data or []
+    if not registros and user_id and user_email:
+        busca = await asyncio.to_thread(
+            lambda: supabase_admin.table("cortes")
+            .select("id,titulo,video_url,storage_path,user_email")
+            .eq("user_email", user_email)
+            .in_("id", dados.ids)
+            .execute()
+        )
+        registros = busca.data or []
     if not registros:
         raise HTTPException(404, "Nenhum recorte encontrado para download.")
 
@@ -1634,6 +2228,12 @@ async def baixar_cortes_em_massa(dados: BulkDeleteRequest, usuario: dict = Depen
                 nome_base = sanitizar(corte.get("titulo") or f"recorte_{i}").removesuffix(".mp4")
                 nome_zip = f"{nome_base}_{i}.mp4"
                 url = corte.get("video_url", "")
+                storage_path = corte.get("storage_path") or _extrair_objeto_storage(url)
+                if storage_path:
+                    destino = pasta_temp / f"tmp_{i}.mp4"
+                    await _baixar_storage_para_arquivo(storage_path, destino)
+                    zipf.write(destino, arcname=nome_zip)
+                    continue
                 if url.startswith("/outputs/"):
                     arquivo = Path(url.removeprefix("/")).resolve()
                     if arquivo.exists():
