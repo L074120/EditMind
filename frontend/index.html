@@ -133,7 +133,6 @@
                 <select id="quantidade-recortes" class="input-field select-field">
                     <option value="1">1 recorte</option>
                     <option value="2">2 recortes</option>
-                    <option value="3">3 recortes</option>
                 </select>
 
                 <div id="recortes-config" class="recortes-config"></div>
@@ -284,20 +283,20 @@
                         <span class="card-label">Preset padrão dos recortes</span>
                     </div>
                     <div class="engine-grid">
-                        <div class="engine-card" data-preset="<30s" onclick="selecionarEnginePreset(this)">
-                            <div class="engine-label">&lt; 30s</div>
+                        <div class="engine-card" data-duration="5s" onclick="selecionarEnginePreset(this)">
+                            <div class="engine-label">5s</div>
                             <div class="engine-name">Vídeo Rápido</div>
-                            <div class="engine-desc">Alta retenção e loop rápido. Cortes de 10 a 29 segundos.</div>
+                            <div class="engine-desc">Alta retenção e processamento mais leve para demo.</div>
                         </div>
-                        <div class="engine-card selected" data-preset="30s-60s" onclick="selecionarEnginePreset(this)">
-                            <div class="engine-label">30s – 60s</div>
+                        <div class="engine-card selected" data-duration="10s" onclick="selecionarEnginePreset(this)">
+                            <div class="engine-label">10s</div>
                             <div class="engine-name">Corte Padrão</div>
-                            <div class="engine-desc">Formato equilibrado para narrativa e engajamento.</div>
+                            <div class="engine-desc">Equilíbrio entre velocidade, contexto e apresentação.</div>
                         </div>
-                        <div class="engine-card" data-preset=">60s" onclick="selecionarEnginePreset(this)">
-                            <div class="engine-label">&gt; 60s</div>
+                        <div class="engine-card" data-duration="30s" onclick="selecionarEnginePreset(this)">
+                            <div class="engine-label">30s</div>
                             <div class="engine-name">Corte Profundo</div>
-                            <div class="engine-desc">Para narrativa longa e contexto, com até 90 segundos.</div>
+                            <div class="engine-desc">Mais contexto, ainda dentro do limite seguro da demo.</div>
                         </div>
                     </div>
                 </div>

@@ -7,7 +7,7 @@
    ============================================================ */
 
 const API = window.CONFIG?.API_URL ?? '';
-const TIMEOUT = 5 * 60 * 1000;
+const TIMEOUT = 3 * 60 * 1000;
 
 const $ = id => document.getElementById(id);
 
@@ -55,24 +55,26 @@ const FOCOS = [
 ];
 
 const DURACOES = [
-    { value: 'curto', label: '< 30s' },
-    { value: 'medio', label: '30s - 60s' },
-    { value: 'longo', label: '> 60s' },
+    { value: '5s', label: '5s' },
+    { value: '10s', label: '10s' },
+    { value: '15s', label: '15s' },
+    { value: '30s', label: '30s' },
 ];
 
 const PRESET_PARA_DURACAO = {
-    '<30s': 'curto',
-    '30s-60s': 'medio',
-    '>60s': 'longo',
+    '<30s': '10s',
+    '30s-60s': '15s',
+    '>60s': '30s',
 };
 
 const DURACAO_PARA_PRESET = {
-    curto: '<30s',
-    medio: '30s-60s',
-    longo: '>60s',
+    '5s': '<30s',
+    '10s': '<30s',
+    '15s': '30s-60s',
+    '30s': '>60s',
 };
 
-let engineDuracaoPadrao = 'medio';
+let engineDuracaoPadrao = '10s';
 let _iv = null;
 let _t0 = null;
 
@@ -152,15 +154,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // ── ENGINE PRESETS ───────────────────────────────────────────
 function normalizarPresetEngine(valor) {
-    if (!valor) return 'medio';
+    if (!valor) return '10s';
     const v = String(valor).trim();
     if (PRESET_PARA_DURACAO[v]) return PRESET_PARA_DURACAO[v];
-    return ['curto', 'medio', 'longo'].includes(v) ? v : 'medio';
+    return DURACOES.some(d => d.value === v) ? v : '10s';
 }
 
 window.selecionarEnginePreset = function (card) {
     if (!card) return;
-    const valor = card.getAttribute('data-preset') || card.getAttribute('data-duration') || 'medio';
+    const valor = card.getAttribute('data-preset') || card.getAttribute('data-duration') || '10s';
     engineDuracaoPadrao = normalizarPresetEngine(valor);
 
     document.querySelectorAll('.engine-card[data-duration], .engine-card[data-preset]').forEach(c => {
@@ -189,7 +191,7 @@ function getAuthHeaders(extra = {}) {
 // ── CONFIGURAÇÃO DE RECORTES ─────────────────────────────────
 function renderRecortesConfig() {
     if (!recortesConfig) return;
-    const qtd = Math.max(1, Math.min(3, Number(quantidadeRecortes?.value || 1)));
+    const qtd = Math.max(1, Math.min(2, Number(quantidadeRecortes?.value || 1)));
     const html = Array.from({ length: qtd }, (_, i) => {
         const n = i + 1;
         return `
@@ -216,7 +218,7 @@ function renderRecortesConfig() {
 }
 
 function coletarConfigProcessamento() {
-    const qtd = Math.max(1, Math.min(3, Number(quantidadeRecortes?.value || 1)));
+    const qtd = Math.max(1, Math.min(2, Number(quantidadeRecortes?.value || 1)));
     const cortes = [];
     for (let i = 1; i <= qtd; i++) {
         cortes.push({
@@ -509,7 +511,7 @@ function exibirResultado(data) {
         url_corte: data.url_corte,
         storage: data.storage,
         foco: 'Livre',
-        duracao_tipo: 'medio'
+        duracao_tipo: '10s'
     }];
 
     const primeiro = cortes[0] || {};
@@ -710,7 +712,16 @@ async function renderCortesProjeto(projectId) {
     window.projetoAtualId = projectId;
     window.meusCortes = projeto.clips || [];
     limparSelecaoCortes();
-    conteudosLista.innerHTML = `<div class="result-btns"><button type="button" class="btn-secondary-lite" id="btn-voltar-projetos">← Voltar para projetos</button></div>` + projeto.clips.map((corte) => {
+    const headerProjeto = `<div class="result-btns"><button type="button" class="btn-secondary-lite" id="btn-voltar-projetos">← Voltar para projetos</button></div>`;
+    if (!projeto.clips?.length) {
+        conteudosLista.innerHTML = `${headerProjeto}
+            <div class="tool-bentoCard empty-state">
+                <h3 class="upload-title">Projeto sem clipes salvos</h3>
+                <p class="upload-subtitle">Salve os recortes gerados para que eles apareçam aqui.</p>
+            </div>`;
+        return;
+    }
+    conteudosLista.innerHTML = headerProjeto + projeto.clips.map((corte) => {
         const titulo = escaparHtml(corte.titulo || 'Sem título');
         const dataFmt = formatarDataPtBR(corte.criado_em);
         const urlVideo = montarUrlVideo(corte.video_url);
@@ -719,7 +730,7 @@ async function renderCortesProjeto(projectId) {
         const duracaoTipo = escaparHtml(duracaoLabel(corte.duracao_tipo));
         return `
             <article class="tool-bentoCard conteudo-card" data-corte-id="${corteId}">
-                <label class="conteudo-select-wrap"><input type="checkbox" class="conteudo-select" data-corte-id="${corteId}"> Selecionar</label>
+                <label class="conteudo-select-wrap"><input type="checkbox" class="conteudo-select" data-corte-id="${corteId}"><span class="conteudo-check-ui"></span><span>Selecionar</span></label>
                 <video src="${urlVideo}" controls preload="metadata" class="conteudo-video"></video>
                 <h3 class="tool-title conteudo-title">${titulo}</h3>
                 <p class="tool-description conteudo-date">Criado em: ${dataFmt}</p>
@@ -910,18 +921,37 @@ function atualizarContadorSelecao() {
     conteudosCount.textContent = `${total} selecionado${total === 1 ? '' : 's'}`;
 }
 
+function atualizarVisualSelecaoCorte(checkbox) {
+    const card = checkbox?.closest('.conteudo-card');
+    if (card) card.classList.toggle('is-selected', Boolean(checkbox.checked));
+}
+
+function alternarSelecaoCorte(checkbox) {
+    if (!checkbox) return;
+    const id = checkbox.getAttribute('data-corte-id');
+    if (!id) return;
+    if (checkbox.checked) window.selectedCortes.add(id);
+    else window.selectedCortes.delete(id);
+    atualizarVisualSelecaoCorte(checkbox);
+    atualizarContadorSelecao();
+}
+
 function selecionarTodosCortes() {
     document.querySelectorAll('.conteudo-select').forEach(cb => {
         cb.checked = true;
         const id = cb.getAttribute('data-corte-id');
         if (id) window.selectedCortes.add(id);
+        atualizarVisualSelecaoCorte(cb);
     });
     atualizarContadorSelecao();
 }
 
 function limparSelecaoCortes() {
     window.selectedCortes.clear();
-    document.querySelectorAll('.conteudo-select').forEach(cb => { cb.checked = false; });
+    document.querySelectorAll('.conteudo-select').forEach(cb => {
+        cb.checked = false;
+        atualizarVisualSelecaoCorte(cb);
+    });
     atualizarContadorSelecao();
 }
 
@@ -998,15 +1028,16 @@ document.addEventListener('click', (event) => {
 
     const cb = event.target.closest('.conteudo-select');
     if (cb) {
-        const id = cb.getAttribute('data-corte-id');
-        if (cb.checked) window.selectedCortes.add(id);
-        else window.selectedCortes.delete(id);
-        atualizarContadorSelecao();
+        alternarSelecaoCorte(cb);
     }
 });
 
 
 document.addEventListener('change', (e) => {
+    if (e.target.classList.contains('conteudo-select')) {
+        alternarSelecaoCorte(e.target);
+        return;
+    }
     if (!e.target.classList.contains('preview-select')) return;
     const idx = Number(e.target.dataset.index);
     if (e.target.checked) window.previewSelecionados.add(idx); else window.previewSelecionados.delete(idx);

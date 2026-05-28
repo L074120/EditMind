@@ -57,9 +57,14 @@ SITE_URL = os.getenv("SITE_URL", "https://editmind.vercel.app")
 YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
 YTDLP_EXTRACTOR_ARGS = os.getenv("YTDLP_EXTRACTOR_ARGS", "youtube:player_client=android,web")
 
-# Default seguro para Render Free. Para 30 minutos, configure MAX_DURACAO_S=1800 no Render.
+# Default seguro para Render Free/demo: 3 minutos.
 MAX_DURACAO_S = int(os.getenv("MAX_DURACAO_S", "180"))
 MAX_BYTES = int(os.getenv("MAX_BYTES", str(200 * 1024 * 1024)))
+MAX_RECORTES = int(os.getenv("MAX_RECORTES", "2"))
+FFMPEG_PRESET = os.getenv("FFMPEG_PRESET", "ultrafast")
+FFMPEG_CRF = os.getenv("FFMPEG_CRF", "26")
+FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "2")
+DEMO_MAX_WIDTH = int(os.getenv("DEMO_MAX_WIDTH", "720"))
 
 # ── Clientes ──────────────────────────────────────────────────
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -94,9 +99,10 @@ YT_DLP_USER_AGENT = (
 )
 
 DURACAO_CONFIGS = {
-    "curto": {"label": "< 30s", "min": 10.0, "max": 29.0, "target": 24.0},
-    "medio": {"label": "30s - 60s", "min": 30.0, "max": 60.0, "target": 45.0},
-    "longo": {"label": "> 60s", "min": 61.0, "max": 90.0, "target": 75.0},
+    "5s": {"label": "5s", "min": 4.0, "max": 7.0, "target": 5.0},
+    "10s": {"label": "10s", "min": 8.0, "max": 12.0, "target": 10.0},
+    "15s": {"label": "15s", "min": 12.0, "max": 18.0, "target": 15.0},
+    "30s": {"label": "30s", "min": 24.0, "max": 32.0, "target": 30.0},
 }
 
 FOCOS_VALIDOS = {
@@ -265,17 +271,24 @@ class BulkDeleteRequest(BaseModel):
 
 
 class CorteConfig(BaseModel):
-    duracao_tipo: str = "medio"
+    duracao_tipo: str = "10s"
     foco: str = "Livre"
 
     @field_validator("duracao_tipo")
     @classmethod
     def duracao_ok(cls, v: str) -> str:
-        v = (v or "medio").strip().lower()
-        aliases = {"rapido": "curto", "rápido": "curto", "padrao": "medio", "padrão": "medio", "profundo": "longo"}
+        v = (v or "10s").strip().lower()
+        demo_aliases = {
+            "rapido": "5s", "rÃ¡pido": "5s", "curto": "10s",
+            "padrao": "15s", "padrÃ£o": "15s", "medio": "15s",
+            "longo": "30s", "profundo": "30s",
+            "5": "5s", "10": "10s", "15": "15s", "30": "30s",
+        }
+        aliases = {}
+        aliases.update(demo_aliases)
         v = aliases.get(v, v)
         if v not in DURACAO_CONFIGS:
-            return "medio"
+            return "10s"
         return v
 
     @field_validator("foco")
@@ -294,7 +307,7 @@ class ProcessamentoConfig(BaseModel):
     def cortes_ok(cls, v: list[CorteConfig]) -> list[CorteConfig]:
         if not v:
             return [CorteConfig()]
-        return v[:3]
+        return v[:MAX_RECORTES]
 
 
 class LinkRequest(BaseModel):
@@ -413,6 +426,19 @@ async def obter_metadados(caminho: str) -> dict:
     return {"resolucao": res, "fps": str(fps), "duracao_segundos": str(dur)}
 
 
+async def validar_duracao_entrada(caminho: str) -> dict:
+    metadados = await obter_metadados(caminho)
+    duracao = float(metadados.get("duracao_segundos") or 0)
+    if duracao <= 0:
+        raise HTTPException(400, "NÃ£o foi possÃ­vel ler a duraÃ§Ã£o do vÃ­deo.")
+    if duracao > MAX_DURACAO_S:
+        raise HTTPException(
+            413,
+            f"VÃ­deo longo demais ({int(duracao)}s). Para a demo, envie vÃ­deos de atÃ© {MAX_DURACAO_S // 60} minuto(s).",
+        )
+    return metadados
+
+
 async def obter_info_codecs(caminho: str) -> dict:
     proc = await asyncio.create_subprocess_exec(
         "ffprobe", "-v", "quiet", "-print_format", "json",
@@ -446,9 +472,11 @@ async def normalizar_video_para_browser(entrada: str, saida: str, forcar_reencod
 
     await _ffmpeg(
         "-y", "-i", entrada,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        "-vf", f"scale='min({DEMO_MAX_WIDTH},iw)':-2",
+        "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", FFMPEG_CRF,
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+        "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+        "-threads", FFMPEG_THREADS,
         "-movflags", "+faststart",
         saida,
     )
@@ -463,21 +491,39 @@ async def extrair_audio(video: str, audio: str) -> None:
 
 
 async def cortar_video(entrada: str, saida: str, inicio: float, fim: float, formato_vertical: bool = False) -> None:
+    duracao = max(0.1, float(fim) - float(inicio))
+    if not formato_vertical:
+        info = await obter_info_codecs(entrada)
+        if info["video_codec"] == "h264" and info["audio_codec"] in {"aac", "mp4a"}:
+            try:
+                await _ffmpeg(
+                    "-y", "-ss", str(inicio), "-i", entrada, "-t", f"{duracao:.3f}",
+                    "-c", "copy", "-movflags", "+faststart", saida
+                )
+                meta_saida = await obter_metadados(saida)
+                if float(meta_saida.get("duracao_segundos") or 0) > 0:
+                    return
+            except Exception as e:
+                logger.warning(f"Stream copy falhou; recodificando corte: {e}")
+
     if formato_vertical:
         # Vertical 9:16 sem achatamento: mantém proporção e adiciona padding.
-        filtro = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1"
+        filtro = "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,setsar=1"
         await _ffmpeg(
-            "-y", "-ss", str(inicio), "-to", str(fim), "-i", entrada,
+            "-y", "-ss", str(inicio), "-i", entrada, "-t", f"{duracao:.3f}",
             "-vf", filtro,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
+            "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", FFMPEG_CRF,
+            "-c:a", "aac", "-b:a", "96k",
+            "-threads", FFMPEG_THREADS,
             "-movflags", "+faststart", saida
         )
     else:
         await _ffmpeg(
-            "-y", "-ss", str(inicio), "-to", str(fim), "-i", entrada,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+            "-y", "-ss", str(inicio), "-i", entrada, "-t", f"{duracao:.3f}",
+            "-vf", f"scale='min({DEMO_MAX_WIDTH},iw)':-2",
+            "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", FFMPEG_CRF, "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+            "-threads", FFMPEG_THREADS,
             "-movflags", "+faststart", saida
         )
 
@@ -491,10 +537,13 @@ async def renderizar_edicao_video(
     remove_fim: Optional[float] = None,
 ) -> None:
     if remove_inicio is None and remove_fim is None:
+        duracao = max(0.1, float(fim) - float(inicio))
         await _ffmpeg(
-            "-y", "-ss", f"{inicio:.3f}", "-to", f"{fim:.3f}", "-i", entrada,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+            "-y", "-ss", f"{inicio:.3f}", "-i", entrada, "-t", f"{duracao:.3f}",
+            "-vf", f"scale='min({DEMO_MAX_WIDTH},iw)':-2",
+            "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", FFMPEG_CRF, "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+            "-threads", FFMPEG_THREADS,
             "-movflags", "+faststart",
             saida,
         )
@@ -514,9 +563,11 @@ async def renderizar_edicao_video(
                 return
             part_path = tmp / f"part_{idx}.mp4"
             await _ffmpeg(
-                "-y", "-ss", f"{a:.3f}", "-to", f"{b:.3f}", "-i", entrada,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+                "-y", "-ss", f"{a:.3f}", "-i", entrada, "-t", f"{(b - a):.3f}",
+                "-vf", f"scale='min({DEMO_MAX_WIDTH},iw)':-2",
+                "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", FFMPEG_CRF, "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+                "-threads", FFMPEG_THREADS,
                 "-movflags", "+faststart",
                 str(part_path),
             )
@@ -612,6 +663,48 @@ def config_from_link_request(dados: LinkRequest) -> ProcessamentoConfig:
 # ══════════════════════════════════════════════════════════════
 # HELPERS — YT-DLP (YouTube/TikTok)
 # ══════════════════════════════════════════════════════════════
+
+async def _ytdlp_validar_duracao(url: str) -> None:
+    validar_url_midia(url)
+    args = [
+        "yt-dlp",
+        "--dump-single-json",
+        "--skip-download",
+        "--no-playlist",
+        "--no-check-certificates",
+        "--socket-timeout", "20",
+        "--no-cache-dir",
+        "--extractor-args", YTDLP_EXTRACTOR_ARGS,
+        "--user-agent", YT_DLP_USER_AGENT,
+        url,
+    ]
+    if YTDLP_COOKIES_FILE and Path(YTDLP_COOKIES_FILE).exists():
+        args[1:1] = ["--cookies", YTDLP_COOKIES_FILE]
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=35)
+    except asyncio.TimeoutError:
+        proc.kill()
+        logger.warning("yt-dlp metadata timeout; seguindo para download com validacao por ffprobe.")
+        return
+    if proc.returncode != 0:
+        logger.warning(f"yt-dlp metadata falhou; seguindo para download. Erro: {stderr.decode(errors='replace')[-300:]}")
+        return
+    try:
+        dados = json.loads(stdout.decode() or "{}")
+        duracao = float(dados.get("duration") or 0)
+    except Exception:
+        duracao = 0
+    if duracao > MAX_DURACAO_S:
+        raise HTTPException(
+            413,
+            f"Video longo demais ({int(duracao)}s). Para a demo, use links de ate {MAX_DURACAO_S // 60} minuto(s).",
+        )
+
 
 async def _ytdlp_download(url: str, output_path: str) -> None:
     validar_url_midia(url)
@@ -728,7 +821,7 @@ async def transcrever(audio_path: str) -> str:
 
 
 def _limites_duracao(tipo: str, duracao_video: float) -> tuple[float, float, float]:
-    cfg = DURACAO_CONFIGS.get(tipo, DURACAO_CONFIGS["medio"])
+    cfg = DURACAO_CONFIGS.get(tipo, DURACAO_CONFIGS["10s"])
     minimo = min(cfg["min"], max(1.0, duracao_video))
     maximo = min(cfg["max"], max(1.0, duracao_video))
     alvo = min(cfg["target"], maximo)
@@ -861,16 +954,24 @@ async def upload_storage(caminho_local: str, nome_arquivo: str) -> Optional[str]
         raise ValueError("nome_arquivo e obrigatorio para upload no Storage.")
 
     try:
-        with open(caminho_local, "rb") as f:
-            dados = f.read()
+        def _upload_file():
+            with open(caminho_local, "rb") as f:
+                return supabase_admin.storage.from_(STORAGE_BUCKET).upload(
+                    nome_arquivo,
+                    f,
+                    {"content-type": "video/mp4", "upsert": "true"},
+                )
 
-        await asyncio.to_thread(
-            lambda: supabase_admin.storage.from_(STORAGE_BUCKET).upload(
+        try:
+            await asyncio.to_thread(_upload_file)
+        except Exception:
+            with open(caminho_local, "rb") as f:
+                dados = f.read()
+            await asyncio.to_thread(lambda: supabase_admin.storage.from_(STORAGE_BUCKET).upload(
                 nome_arquivo,
                 dados,
                 {"content-type": "video/mp4", "upsert": "true"},
-            )
-        )
+            ))
 
         url_resp = await asyncio.to_thread(
             lambda: supabase_admin.storage.from_(STORAGE_BUCKET).get_public_url(nome_arquivo)
@@ -1051,6 +1152,19 @@ async def _normalizar_cortes_saida(cortes: list[dict]) -> list[dict]:
     return [await _normalizar_corte_saida(corte) for corte in (cortes or [])]
 
 
+async def _normalizar_projeto_saida(projeto: dict) -> dict:
+    saida = dict(projeto or {})
+    cuts = await _normalizar_cortes_saida(saida.get("cuts") or [])
+    saida["cuts"] = cuts
+    saida["clips_count"] = len(cuts)
+    thumb = saida.get("thumbnail_url") or ((cuts[0] or {}).get("video_url") if cuts else None)
+    storage_thumb = _extrair_objeto_storage(str(thumb or ""))
+    if storage_thumb:
+        thumb = await _signed_storage_url(storage_thumb)
+    saida["thumbnail_url"] = thumb
+    return saida
+
+
 def _filtrar_por_usuario(query, usuario: dict):
     user_id = usuario.get("id")
     user_email = usuario.get("email")
@@ -1191,7 +1305,7 @@ async def _pipeline(video_path: str, job_id: str, tasks: BackgroundTasks, pasta_
             "duracao_segundos": round(analise["fim"] - analise["inicio"], 2),
             "motivo": analise.get("motivo", "Trecho viral identificado."),
             "foco": analise.get("foco", "Livre"),
-            "duracao_tipo": analise.get("duracao_tipo", "medio"),
+            "duracao_tipo": analise.get("duracao_tipo", "10s"),
             "url_corte": url_corte,
             "storage": "supabase" if url_publica else "local",
             "formato_vertical": config.formato_vertical,
@@ -1338,13 +1452,22 @@ async def _listar_projetos_banco(usuario: dict) -> Optional[list[dict]]:
     projetos = []
     for row in projetos_resp.data or []:
         pid = row.get("id")
-        projetos.append(_projeto_db_para_api(row, por_projeto.get(pid, [])))
+        cuts = por_projeto.get(pid, [])
+        if not cuts and pid and _project_file(pid).exists():
+            try:
+                local = _load_project(pid)
+                if _usuario_eh_dono_projeto(local, usuario):
+                    cuts = await _normalizar_cortes_saida(local.get("cuts") or [])
+            except Exception:
+                cuts = []
+        projetos.append(_projeto_db_para_api(row, cuts))
 
     ids_com_projeto = {p.get("project_id") for p in projetos}
     for pid, cuts in por_projeto.items():
         if pid and pid not in ids_com_projeto:
             projetos.append(_projeto_db_para_api({"id": pid, "titulo_original": cuts[0].get("titulo")}, cuts))
 
+    projetos = [await _normalizar_projeto_saida(p) for p in projetos]
     projetos.sort(key=lambda x: x.get("created_at") or "", reverse=True)
     return projetos
 
@@ -1361,9 +1484,6 @@ async def _detalhar_projeto_banco(project_id: str, usuario: dict) -> Optional[di
             .limit(1)
             .execute()
         )
-        projeto = (projeto_resp.data or [None])[0]
-        if not projeto:
-            return None
         cortes_resp = await asyncio.to_thread(
             lambda: supabase_admin.table("cortes")
             .select("*")
@@ -1373,7 +1493,12 @@ async def _detalhar_projeto_banco(project_id: str, usuario: dict) -> Optional[di
             .execute()
         )
         cortes = await _normalizar_cortes_saida(cortes_resp.data or [])
-        return _projeto_db_para_api(projeto, cortes)
+        projeto = (projeto_resp.data or [None])[0]
+        if not projeto and cortes:
+            projeto = {"id": project_id, "titulo_original": cortes[0].get("titulo"), "status": "concluido"}
+        if not projeto:
+            return None
+        return await _normalizar_projeto_saida(_projeto_db_para_api(projeto, cortes))
     except Exception as e:
         logger.warning(f"Detalhe de projeto via banco indisponivel, usando fallback local: {e}")
         return None
@@ -1527,9 +1652,10 @@ async def processar_video(
                     raise HTTPException(413, f"Arquivo muito grande. Máx {MAX_BYTES // 1024 // 1024}MB.")
                 f_out.write(chunk)
 
+        metadados_entrada = await validar_duracao_entrada(str(video_path))
         projeto = _create_project(file.filename or f"upload_{job_id}", "upload", usuario)
         resultado = await _pipeline(str(video_path), job_id, tasks, pasta_temp, config, projeto["project_id"], persist=False)
-        projeto["duration_seconds"] = float((resultado.get("detalhes_tecnicos") or {}).get("duracao_segundos") or 0)
+        projeto["duration_seconds"] = float(metadados_entrada.get("duracao_segundos") or 0)
         projeto["preview_cuts"] = resultado.get("cortes", [])
         projeto["thumbnail_url"] = (resultado.get("cortes") or [{}])[0].get("url_corte")
         _save_project(projeto)
@@ -1554,7 +1680,9 @@ async def processar_link(tasks: BackgroundTasks, dados: LinkRequest, usuario: di
     video_path = str(pasta_temp / "video.mp4")
     logger.info(f"Link Job {job_id} | usuário: {usuario['email']} | {dados.url} | cortes={len(config.cortes)}")
     try:
+        await _ytdlp_validar_duracao(dados.url)
         await _ytdlp_download(dados.url, video_path)
+        await validar_duracao_entrada(video_path)
         video_normalizado = str(pasta_temp / "video_browser.mp4")
         await normalizar_video_para_browser(video_path, video_normalizado, forcar_reencode=eh_tiktok_url(dados.url))
         origem = "youtube" if eh_youtube_url(dados.url) else ("tiktok" if eh_tiktok_url(dados.url) else "link")
@@ -1593,7 +1721,9 @@ async def download_link(tasks: BackgroundTasks, dados: LinkRequest, usuario: dic
     video_path = str(pasta_temp / "video.mp4")
     logger.info(f"DL Job {job_id} | usuário: {usuario['email']} | {dados.url}")
     try:
+        await _ytdlp_validar_duracao(dados.url)
         await _ytdlp_download(dados.url, video_path)
+        await validar_duracao_entrada(video_path)
         video_normalizado = str(pasta_temp / "video_browser.mp4")
         await normalizar_video_para_browser(video_path, video_normalizado, forcar_reencode=eh_tiktok_url(dados.url))
         file_size = Path(video_normalizado).stat().st_size
@@ -1726,11 +1856,9 @@ async def listar_projetos(usuario: dict = Depends(get_current_user)):
         data = json.loads(meta.read_text(encoding="utf-8"))
         if _usuario_eh_dono_projeto(data, usuario):
             cuts = data.get("cuts") or []
-            data["cuts"] = await _normalizar_cortes_saida(cuts)
-            data["clips_count"] = len(cuts)
-            data["thumbnail_url"] = ((data["cuts"][0] or {}).get("video_url") if data["cuts"] else None)
+            data["cuts"] = cuts
             data["status"] = data.get("status") or ("concluido" if cuts else "processado")
-            projetos.append(data)
+            projetos.append(await _normalizar_projeto_saida(data))
     projetos.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return {"sucesso": True, "projetos": projetos}
 
@@ -1739,17 +1867,18 @@ async def listar_projetos(usuario: dict = Depends(get_current_user)):
 async def detalhe_projeto(project_id: str, usuario: dict = Depends(get_current_user)):
     project_id = _safe_project_id(project_id)
     projeto_banco = await _detalhar_projeto_banco(project_id, usuario)
-    if projeto_banco is not None:
+    if projeto_banco is not None and projeto_banco.get("clips_count", 0) > 0:
+        return {"sucesso": True, "projeto": projeto_banco}
+    if projeto_banco is not None and not _project_file(project_id).exists():
         return {"sucesso": True, "projeto": projeto_banco}
 
     projeto = _load_project(project_id)
     if not _usuario_eh_dono_projeto(projeto, usuario):
         raise HTTPException(403, "Projeto não pertence ao usuário autenticado.")
     cuts = projeto.get("cuts") or []
-    projeto["cuts"] = await _normalizar_cortes_saida(cuts)
-    projeto["clips_count"] = len(cuts)
-    projeto["thumbnail_url"] = ((projeto["cuts"][0] or {}).get("video_url") if projeto["cuts"] else None)
+    projeto["cuts"] = cuts
     projeto["status"] = projeto.get("status") or ("concluido" if cuts else "processado")
+    projeto = await _normalizar_projeto_saida(projeto)
     return {"sucesso": True, "projeto": projeto}
 
 
