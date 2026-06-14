@@ -7,7 +7,7 @@
    ============================================================ */
 
 const API = window.CONFIG?.API_URL ?? '';
-const TIMEOUT = 3 * 60 * 1000;
+const TIMEOUT = 5 * 60 * 1000;
 
 const $ = id => document.getElementById(id);
 
@@ -43,11 +43,8 @@ const profileSenha = $('profile-senha');
 const profileFeedback = $('profile-feedback');
 
 window.ultimoResultado = null;
-window.previewSelecionados = new Set();
 window.meusCortes = [];
-window.projetosConteudo = [];
 window.selectedCortes = new Set();
-window.projetoAtualId = null;
 
 const FOCOS = [
     'Livre', 'Humor', 'Terror', 'Emocionante', 'Triste',
@@ -55,26 +52,24 @@ const FOCOS = [
 ];
 
 const DURACOES = [
-    { value: '5s', label: '5s' },
-    { value: '10s', label: '10s' },
-    { value: '15s', label: '15s' },
-    { value: '30s', label: '30s' },
+    { value: 'curto', label: '< 30s' },
+    { value: 'medio', label: '30s - 60s' },
+    { value: 'longo', label: '> 60s' },
 ];
 
 const PRESET_PARA_DURACAO = {
-    '<30s': '10s',
-    '30s-60s': '15s',
-    '>60s': '30s',
+    '<30s': 'curto',
+    '30s-60s': 'medio',
+    '>60s': 'longo',
 };
 
 const DURACAO_PARA_PRESET = {
-    '5s': '<30s',
-    '10s': '<30s',
-    '15s': '30s-60s',
-    '30s': '>60s',
+    curto: '<30s',
+    medio: '30s-60s',
+    longo: '>60s',
 };
 
-let engineDuracaoPadrao = '10s';
+let engineDuracaoPadrao = 'medio';
 let _iv = null;
 let _t0 = null;
 
@@ -154,15 +149,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // ── ENGINE PRESETS ───────────────────────────────────────────
 function normalizarPresetEngine(valor) {
-    if (!valor) return '10s';
+    if (!valor) return 'medio';
     const v = String(valor).trim();
     if (PRESET_PARA_DURACAO[v]) return PRESET_PARA_DURACAO[v];
-    return DURACOES.some(d => d.value === v) ? v : '10s';
+    return ['curto', 'medio', 'longo'].includes(v) ? v : 'medio';
 }
 
 window.selecionarEnginePreset = function (card) {
     if (!card) return;
-    const valor = card.getAttribute('data-preset') || card.getAttribute('data-duration') || '10s';
+    const valor = card.getAttribute('data-preset') || card.getAttribute('data-duration') || 'medio';
     engineDuracaoPadrao = normalizarPresetEngine(valor);
 
     document.querySelectorAll('.engine-card[data-duration], .engine-card[data-preset]').forEach(c => {
@@ -177,7 +172,7 @@ window.selecionarEnginePreset = function (card) {
 
 // ── AUTH HELPERS ─────────────────────────────────────────────
 function getAuthToken() {
-    return localStorage.getItem(window.CONFIG?.TOKEN_KEY || 'editmind_token') || window.Auth?.getToken?.() || null;
+    return localStorage.getItem('editmind_token') || window.Auth?.getToken?.() || null;
 }
 
 function getAuthHeaders(extra = {}) {
@@ -191,7 +186,7 @@ function getAuthHeaders(extra = {}) {
 // ── CONFIGURAÇÃO DE RECORTES ─────────────────────────────────
 function renderRecortesConfig() {
     if (!recortesConfig) return;
-    const qtd = Math.max(1, Math.min(2, Number(quantidadeRecortes?.value || 1)));
+    const qtd = Math.max(1, Math.min(3, Number(quantidadeRecortes?.value || 1)));
     const html = Array.from({ length: qtd }, (_, i) => {
         const n = i + 1;
         return `
@@ -218,7 +213,7 @@ function renderRecortesConfig() {
 }
 
 function coletarConfigProcessamento() {
-    const qtd = Math.max(1, Math.min(2, Number(quantidadeRecortes?.value || 1)));
+    const qtd = Math.max(1, Math.min(3, Number(quantidadeRecortes?.value || 1)));
     const cortes = [];
     for (let i = 1; i <= qtd; i++) {
         cortes.push({
@@ -372,7 +367,6 @@ async function processarLinkGenerico(inputId, btnId, nomeFonte) {
     if (btn) { btn.disabled = true; btn.textContent = 'Processando...'; }
 
     const config = coletarConfigProcessamento();
-    try {
     await _executar(async (ctrl) =>
         fetch(`${API}/api/processar-link`, {
             method: 'POST',
@@ -382,10 +376,8 @@ async function processarLinkGenerico(inputId, btnId, nomeFonte) {
         })
     );
 
-    } finally {
-        if (btn) { btn.textContent = 'Processar'; btn.disabled = false; }
-        if (input) input.value = '';
-    }
+    if (btn) { btn.textContent = 'Processar'; btn.disabled = false; }
+    if (input) input.value = '';
 }
 
 window.processarYouTube = () => processarLinkGenerico('input-youtube', 'btn-yt-processar', 'YouTube');
@@ -511,7 +503,7 @@ function exibirResultado(data) {
         url_corte: data.url_corte,
         storage: data.storage,
         foco: 'Livre',
-        duracao_tipo: '10s'
+        duracao_tipo: 'medio'
     }];
 
     const primeiro = cortes[0] || {};
@@ -529,7 +521,7 @@ function exibirResultado(data) {
 
     const area = $('area-download');
     if (!area) return;
-    area.innerHTML = cortes.map((corte, idx) => renderCorteResultado(corte, idx)).join('') + '<div class="result-btns"><button type="button" id="btn-confirmar-cortes" class="btn-upload">Salvar cortes selecionados</button></div>';
+    area.innerHTML = cortes.map((corte, idx) => renderCorteResultado(corte, idx)).join('');
 }
 
 function renderCorteResultado(corte, idx) {
@@ -554,7 +546,6 @@ function renderCorteResultado(corte, idx) {
             <p class="resultado-motivo">${escaparHtml(corte.motivo || 'Trecho viral identificado.')}</p>
             <div class="result-btns">
                 <button type="button" class="btn-assistir btn-play-inline">Assistir</button>
-                <label><input type="checkbox" class="preview-select" data-index="${corte.index || idx+1}" checked> Salvar</label>
                 <button type="button" class="btn-download btn-download-video" data-url="${urlCorte}">Baixar MP4</button>
             </div>
         </article>
@@ -568,7 +559,6 @@ window.resetarNovoCorte = function () {
         if (painelUpload) painelUpload.classList.remove('hidden');
         resetUI();
         window.ultimoResultado = null;
-window.previewSelecionados = new Set();
     }, 400);
 };
 
@@ -638,90 +628,7 @@ function renderConteudos(cortes) {
     }
     limparSelecaoCortes();
 
-    const agrupar = new Map();
-    window.meusCortes.forEach((c) => {
-        const pid = c.project_id || 'sem-projeto';
-        if (!agrupar.has(pid)) agrupar.set(pid, []);
-        agrupar.get(pid).push(c);
-    });
-    window.projetosConteudo = Array.from(agrupar.entries()).map(([project_id, clips]) => ({ project_id, clips }));
-    renderListaProjetos();
-}
-
-function renderProjetos(projetos) {
-    if (!conteudosLista) return;
-    const lista = Array.isArray(projetos) ? projetos : [];
-    window.projetosConteudo = lista.map((p) => ({
-        ...p,
-        project_id: p.project_id || p.id || 'sem-projeto',
-        clips: Array.isArray(p.cuts) ? p.cuts : (Array.isArray(p.clips) ? p.clips : []),
-    }));
-    window.meusCortes = window.projetosConteudo.flatMap(p => p.clips || []);
-    if (!window.projetosConteudo.length) {
-        renderEmptyStateConteudos();
-        limparSelecaoCortes();
-        return;
-    }
-    limparSelecaoCortes();
-    renderListaProjetos();
-}
-
-function renderListaProjetos() {
-    if (!conteudosLista) return;
-    window.projetoAtualId = null;
-    if (!window.projetosConteudo.length) return renderEmptyStateConteudos();
-    conteudosLista.innerHTML = window.projetosConteudo.map((projeto) => {
-        const primeiro = projeto.clips[0] || {};
-        const titulo = escaparHtml(projeto.original_title || primeiro.titulo || `Projeto ${projeto.project_id}`);
-        const dataFmt = formatarDataPtBR(projeto.created_at || primeiro.criado_em);
-        const status = projeto.status || primeiro.status || 'concluido';
-        const preview = montarUrlVideo(projeto.thumbnail_url || primeiro.video_url || '');
-        const totalClips = Number(projeto.clips_count ?? projeto.clips?.length ?? 0);
-        const duracao = projeto.duration_seconds ? `${Number(projeto.duration_seconds).toFixed(1)}s` : 'indisponivel';
-        return `
-            <article class="tool-bentoCard conteudo-card">
-                <h3 class="tool-title conteudo-title">${titulo}</h3>
-                <p class="tool-description conteudo-date">Criado em: ${dataFmt}</p>
-                <p class="conteudo-tags">Clipes: <b>${totalClips}</b> &middot; Duração: <b>${escaparHtml(duracao)}</b> &middot; Status: <b>${escaparHtml(status)}</b></p>
-                ${preview ? `<video src="${preview}" controls preload="metadata" class="conteudo-video"></video>` : ''}
-                <div class="result-btns"><button type="button" class="btn-assistir btn-open-project" data-project-id="${escaparHtml(projeto.project_id)}">Abrir projeto</button></div>
-            </article>
-        `;
-    }).join('');
-}
-
-async function renderCortesProjeto(projectId) {
-    let projeto = window.projetosConteudo.find(p => p.project_id === projectId);
-    try {
-        const res = await fetch(`${API}/api/projetos/${encodeURIComponent(projectId)}`, { headers: getAuthHeaders() });
-        const data = await res.json().catch(() => ({}));
-        if (res.status === 401) { window.Auth.logout(); return; }
-        if (res.ok && data?.sucesso && data.projeto) {
-            projeto = {
-                ...data.projeto,
-                project_id: data.projeto.project_id || projectId,
-                clips: Array.isArray(data.projeto.cuts) ? data.projeto.cuts : [],
-            };
-            const idx = window.projetosConteudo.findIndex(p => p.project_id === projectId);
-            if (idx >= 0) window.projetosConteudo[idx] = projeto;
-        }
-    } catch (err) {
-        console.warn('[EditMind] Fallback para projeto em memória:', err);
-    }
-    if (!projeto) return;
-    window.projetoAtualId = projectId;
-    window.meusCortes = projeto.clips || [];
-    limparSelecaoCortes();
-    const headerProjeto = `<div class="result-btns"><button type="button" class="btn-secondary-lite" id="btn-voltar-projetos">← Voltar para projetos</button></div>`;
-    if (!projeto.clips?.length) {
-        conteudosLista.innerHTML = `${headerProjeto}
-            <div class="tool-bentoCard empty-state">
-                <h3 class="upload-title">Projeto sem clipes salvos</h3>
-                <p class="upload-subtitle">Salve os recortes gerados para que eles apareçam aqui.</p>
-            </div>`;
-        return;
-    }
-    conteudosLista.innerHTML = headerProjeto + projeto.clips.map((corte) => {
+    conteudosLista.innerHTML = window.meusCortes.map((corte) => {
         const titulo = escaparHtml(corte.titulo || 'Sem título');
         const dataFmt = formatarDataPtBR(corte.criado_em);
         const urlVideo = montarUrlVideo(corte.video_url);
@@ -730,7 +637,7 @@ async function renderCortesProjeto(projectId) {
         const duracaoTipo = escaparHtml(duracaoLabel(corte.duracao_tipo));
         return `
             <article class="tool-bentoCard conteudo-card" data-corte-id="${corteId}">
-                <label class="conteudo-select-wrap"><input type="checkbox" class="conteudo-select" data-corte-id="${corteId}"><span class="conteudo-check-ui"></span><span>Selecionar</span></label>
+                <label class="conteudo-select-wrap"><input type="checkbox" class="conteudo-select" data-corte-id="${corteId}"> Selecionar</label>
                 <video src="${urlVideo}" controls preload="metadata" class="conteudo-video"></video>
                 <h3 class="tool-title conteudo-title">${titulo}</h3>
                 <p class="tool-description conteudo-date">Criado em: ${dataFmt}</p>
@@ -739,58 +646,10 @@ async function renderCortesProjeto(projectId) {
                     <a href="${urlVideo}" target="_blank" rel="noopener noreferrer" class="btn-assistir">Abrir vídeo</a>
                     <button type="button" class="btn-download btn-download-video" data-url="${urlVideo}">Baixar</button>
                     <button type="button" class="btn-excluir-corte" data-corte-id="${corteId}">Excluir</button>
-                    <button type="button" class="btn-secondary-lite btn-editar-corte" data-corte-id="${corteId}" data-url="${urlVideo}">Editar</button>
                 </div>
             </article>
         `;
     }).join('');
-}
-
-function abrirModalEdicao(corteId, urlVideo) {
-    const html = `
-    <div id="edit-modal" style="position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;">
-      <div style="background:#111827;border:1px solid #374151;border-radius:12px;max-width:760px;width:100%;padding:16px;color:#fff;">
-        <h3>Editar clipe</h3>
-        <video id="edit-video" src="${urlVideo}" controls style="width:100%;border-radius:8px;margin:8px 0;"></video>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <input id="edit-start" type="number" min="0" step="0.1" placeholder="Início (s)">
-          <input id="edit-end" type="number" min="0" step="0.1" placeholder="Fim (s)">
-          <input id="edit-remove-start" type="number" min="0" step="0.1" placeholder="Remover de (s)">
-          <input id="edit-remove-end" type="number" min="0" step="0.1" placeholder="Remover até (s)">
-        </div>
-        <p id="edit-duration">Duração estimada: 0.0s</p>
-        <div class="result-btns"><button id="edit-save" class="btn-download">Salvar nova versão</button><button id="edit-close" class="btn-excluir-corte">Fechar</button></div>
-      </div></div>`;
-    document.body.insertAdjacentHTML('beforeend', html);
-    const modal = $('edit-modal'), video = $('edit-video'), iStart = $('edit-start'), iEnd = $('edit-end');
-    const iRemoveStart = $('edit-remove-start'), iRemoveEnd = $('edit-remove-end');
-    const calc = () => {
-        let d = Math.max(0, (Number(iEnd.value || 0) - Number(iStart.value || 0)));
-        const rs = iRemoveStart.value === '' ? null : Number(iRemoveStart.value);
-        const re = iRemoveEnd.value === '' ? null : Number(iRemoveEnd.value);
-        if (rs !== null && re !== null && re > rs) d = Math.max(0, d - (re - rs));
-        $('edit-duration').textContent = `Duração estimada: ${d.toFixed(2)}s`;
-    };
-    video.addEventListener('loadedmetadata', () => {
-        iStart.value = '0';
-        if (Number.isFinite(video.duration)) iEnd.value = video.duration.toFixed(1);
-        calc();
-    });
-    [iStart, iEnd, iRemoveStart, iRemoveEnd].forEach(input => input.addEventListener('input', calc));
-    $('edit-close').onclick = () => modal.remove();
-    $('edit-save').onclick = async () => {
-        const payload = { start: Number(iStart.value), end: Number(iEnd.value), replace_original: false };
-        if (iRemoveStart.value !== '' && iRemoveEnd.value !== '') {
-            payload.remove_start = Number(iRemoveStart.value);
-            payload.remove_end = Number(iRemoveEnd.value);
-        }
-        const res = await fetch(`${API}/api/cortes/${corteId}/editar`, { method:'POST', headers:getAuthHeaders({'Content-Type':'application/json'}), body: JSON.stringify(payload) });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok || !data?.ok) return alert(data?.detail || 'Falha ao editar clipe.');
-        modal.remove();
-        if (window.projetoAtualId) renderCortesProjeto(window.projetoAtualId);
-        else carregarMeusConteudos();
-    };
 }
 
 async function carregarMeusConteudos() {
@@ -798,24 +657,15 @@ async function carregarMeusConteudos() {
     if (!token) { window.Auth.logout(); return; }
     try {
         setConteudosFeedback('');
-        const res = await fetch(`${API}/api/projetos`, { method: 'GET', headers: getAuthHeaders() });
+        const res = await fetch(`${API}/api/meus-cortes`, { method: 'GET', headers: getAuthHeaders() });
         if (res.status === 401) { window.Auth.logout(); return; }
         const dados = await res.json();
         if (!res.ok || !dados?.sucesso) throw new Error(dados?.detail || 'Falha ao carregar conteúdos.');
-        renderProjetos(Array.isArray(dados.projetos) ? dados.projetos : []);
+        renderConteudos(Array.isArray(dados.cortes) ? dados.cortes : []);
     } catch (err) {
-        console.warn('[EditMind] Falha ao carregar projetos; tentando histórico legado:', err);
-        try {
-            const legado = await fetch(`${API}/api/meus-cortes`, { method: 'GET', headers: getAuthHeaders() });
-            if (legado.status === 401) { window.Auth.logout(); return; }
-            const dadosLegado = await legado.json();
-            if (!legado.ok || !dadosLegado?.sucesso) throw new Error(dadosLegado?.detail || 'Falha ao carregar conteúdos.');
-            renderConteudos(Array.isArray(dadosLegado.cortes) ? dadosLegado.cortes : []);
-        } catch (fallbackErr) {
-            console.error('[EditMind] Erro ao carregar Meus Conteúdos:', fallbackErr);
-            setConteudosFeedback(fallbackErr.message || 'Falha ao carregar conteúdos.');
-            renderEmptyStateConteudos();
-        }
+        console.error('[EditMind] Erro ao carregar Meus Conteúdos:', err);
+        setConteudosFeedback(err.message || 'Falha ao carregar conteúdos.');
+        renderEmptyStateConteudos();
     }
 }
 
@@ -834,8 +684,7 @@ async function excluirCorte(corteId, btn) {
         window.meusCortes = window.meusCortes.filter(c => c.id !== corteId);
         document.querySelector(`.conteudo-card[data-corte-id="${corteId}"]`)?.remove();
         setConteudosFeedback('Recorte excluído com sucesso.', 'ok');
-        if (window.projetoAtualId) await renderCortesProjeto(window.projetoAtualId);
-        else if (window.meusCortes.length === 0) renderEmptyStateConteudos();
+        if (window.meusCortes.length === 0) renderEmptyStateConteudos();
     } catch (err) {
         console.error(`[EditMind] Erro ao excluir recorte ${corteId}:`, err);
         setConteudosFeedback(err.message || 'Falha ao excluir recorte.');
@@ -921,37 +770,15 @@ function atualizarContadorSelecao() {
     conteudosCount.textContent = `${total} selecionado${total === 1 ? '' : 's'}`;
 }
 
-function atualizarVisualSelecaoCorte(checkbox) {
-    const card = checkbox?.closest('.conteudo-card');
-    if (card) card.classList.toggle('is-selected', Boolean(checkbox.checked));
-}
-
-function alternarSelecaoCorte(checkbox) {
-    if (!checkbox) return;
-    const id = checkbox.getAttribute('data-corte-id');
-    if (!id) return;
-    if (checkbox.checked) window.selectedCortes.add(id);
-    else window.selectedCortes.delete(id);
-    atualizarVisualSelecaoCorte(checkbox);
-    atualizarContadorSelecao();
-}
-
 function selecionarTodosCortes() {
-    document.querySelectorAll('.conteudo-select').forEach(cb => {
-        cb.checked = true;
-        const id = cb.getAttribute('data-corte-id');
-        if (id) window.selectedCortes.add(id);
-        atualizarVisualSelecaoCorte(cb);
-    });
+    window.meusCortes.forEach(c => { if (c.id) window.selectedCortes.add(c.id); });
+    document.querySelectorAll('.conteudo-select').forEach(cb => { cb.checked = true; });
     atualizarContadorSelecao();
 }
 
 function limparSelecaoCortes() {
     window.selectedCortes.clear();
-    document.querySelectorAll('.conteudo-select').forEach(cb => {
-        cb.checked = false;
-        atualizarVisualSelecaoCorte(cb);
-    });
+    document.querySelectorAll('.conteudo-select').forEach(cb => { cb.checked = false; });
     atualizarContadorSelecao();
 }
 
@@ -985,8 +812,7 @@ async function excluirSelecionados() {
     ids.forEach(id => document.querySelector(`.conteudo-card[data-corte-id="${id}"]`)?.remove());
     limparSelecaoCortes();
     setConteudosFeedback(`${data.excluidos || ids.size} recorte(s) excluído(s).`, 'ok');
-    if (window.projetoAtualId) await renderCortesProjeto(window.projetoAtualId);
-    else if (!window.meusCortes.length) renderEmptyStateConteudos();
+    if (!window.meusCortes.length) renderEmptyStateConteudos();
 }
 
 // ── EVENT DELEGATION ─────────────────────────────────────────
@@ -1011,60 +837,12 @@ document.addEventListener('click', (event) => {
         excluirCorte(btnExcluir.getAttribute('data-corte-id'), btnExcluir);
         return;
     }
-    const btnOpenProject = event.target.closest('.btn-open-project');
-    if (btnOpenProject) {
-        renderCortesProjeto(btnOpenProject.getAttribute('data-project-id'));
-        return;
-    }
-    if (event.target.id === 'btn-voltar-projetos') {
-        renderListaProjetos();
-        return;
-    }
-    const btnEditar = event.target.closest('.btn-editar-corte');
-    if (btnEditar) {
-        abrirModalEdicao(btnEditar.getAttribute('data-corte-id'), btnEditar.getAttribute('data-url'));
-        return;
-    }
 
     const cb = event.target.closest('.conteudo-select');
     if (cb) {
-        alternarSelecaoCorte(cb);
-    }
-});
-
-
-document.addEventListener('change', (e) => {
-    if (e.target.classList.contains('conteudo-select')) {
-        alternarSelecaoCorte(e.target);
-        return;
-    }
-    if (!e.target.classList.contains('preview-select')) return;
-    const idx = Number(e.target.dataset.index);
-    if (e.target.checked) window.previewSelecionados.add(idx); else window.previewSelecionados.delete(idx);
-});
-
-document.addEventListener('click', async (e) => {
-    if (e.target.id !== 'btn-confirmar-cortes') return;
-    const btn = e.target;
-    const projectId = window.ultimoResultado?.project?.project_id;
-    if (!projectId) return alert('Projeto não encontrado para salvar.');
-    const selected = [...document.querySelectorAll('.preview-select:checked')].map(x => Number(x.dataset.index));
-    if (!selected.length) return alert('Selecione ao menos um corte.');
-    btn.disabled = true; btn.textContent = 'Salvando cortes selecionados...';
-    msg('Salvando cortes selecionados...', '#f97316');
-    try {
-        const res = await fetch(`${API}/api/projetos/${projectId}/confirmar-cortes`, {
-            method: 'POST',
-            headers: getAuthHeaders({'Content-Type':'application/json'}),
-            body: JSON.stringify({ selected_indexes: selected }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Erro ao salvar cortes.');
-        msg('Cortes salvos com sucesso.', '#22c55e');
-        btn.textContent = 'Cortes salvos';
-        carregarMeusConteudos();
-    } catch(err){
-        msg(`Erro ao gerar/salvar: ${err.message || 'falha'}`, '#ef4444');
-        btn.disabled = false; btn.textContent = 'Salvar cortes selecionados';
+        const id = cb.getAttribute('data-corte-id');
+        if (cb.checked) window.selectedCortes.add(id);
+        else window.selectedCortes.delete(id);
+        atualizarContadorSelecao();
     }
 });
