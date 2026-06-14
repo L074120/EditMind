@@ -187,22 +187,30 @@ function getAuthHeaders(extra = {}) {
 function renderRecortesConfig() {
     if (!recortesConfig) return;
     const qtd = Math.max(1, Math.min(3, Number(quantidadeRecortes?.value || 1)));
+    const configuracoesAtuais = Array.from(recortesConfig.querySelectorAll('.recorte-config-item')).map(item => ({
+        duracao: item.querySelector('.recorte-duracao')?.value || engineDuracaoPadrao,
+        foco: item.querySelector('.recorte-foco')?.value || 'Livre',
+    }));
     const html = Array.from({ length: qtd }, (_, i) => {
         const n = i + 1;
+        const configuracao = configuracoesAtuais[i] || {
+            duracao: engineDuracaoPadrao,
+            foco: 'Livre',
+        };
         return `
             <div class="recorte-config-item" data-recorte-index="${n}">
                 <div class="recorte-config-title">Recorte ${n}</div>
                 <div class="recorte-config-grid">
                     <div>
-                        <label class="input-label">Duração</label>
-                        <select class="input-field select-field recorte-duracao" data-recorte-duration="${n}">
-                            ${DURACOES.map(d => `<option value="${d.value}" ${d.value === engineDuracaoPadrao ? 'selected' : ''}>${d.label}</option>`).join('')}
+                        <label class="input-label" for="recorte-duracao-${n}">Duração</label>
+                        <select id="recorte-duracao-${n}" class="input-field select-field recorte-duracao" data-recorte-duration="${n}">
+                            ${DURACOES.map(d => `<option value="${d.value}" ${d.value === configuracao.duracao ? 'selected' : ''}>${d.label}</option>`).join('')}
                         </select>
                     </div>
                     <div>
-                        <label class="input-label">Foco do Gancho</label>
-                        <select class="input-field select-field recorte-foco" data-recorte-focus="${n}">
-                            ${FOCOS.map(f => `<option value="${f}">${f}</option>`).join('')}
+                        <label class="input-label" for="recorte-foco-${n}">Foco do Gancho</label>
+                        <select id="recorte-foco-${n}" class="input-field select-field recorte-foco" data-recorte-focus="${n}">
+                            ${FOCOS.map(f => `<option value="${f}" ${f === configuracao.foco ? 'selected' : ''}>${f}</option>`).join('')}
                         </select>
                     </div>
                 </div>
@@ -294,7 +302,14 @@ function escaparHtml(texto) {
 
 function montarUrlVideo(videoUrl) {
     if (!videoUrl) return '#';
-    return videoUrl.startsWith('http') ? videoUrl : `${API}${videoUrl}`;
+    const valor = String(videoUrl).trim();
+    const candidato = valor.startsWith('/outputs/') ? `${API}${valor}` : valor;
+    try {
+        const url = new URL(candidato, window.location.origin);
+        return ['http:', 'https:'].includes(url.protocol) ? url.href : '#';
+    } catch {
+        return '#';
+    }
 }
 
 function formatarDataPtBR(isoString) {
@@ -526,17 +541,18 @@ function exibirResultado(data) {
 
 function renderCorteResultado(corte, idx) {
     const urlCorte = montarUrlVideo(corte.url_corte || corte.video_url);
+    const urlCorteHtml = escaparHtml(urlCorte);
     const storageTag = corte.storage === 'supabase'
         ? '<span class="storage-chip storage-ok">Supabase Storage</span>'
         : '<span class="storage-chip storage-local">Servidor local</span>';
-    const titulo = `Recorte ${corte.index || idx + 1}`;
+    const titulo = escaparHtml(`Recorte ${corte.index || idx + 1}`);
     return `
         <article class="resultado-corte-card">
             <div class="resultado-corte-head">
                 <strong>${titulo}</strong>
                 ${storageTag}
             </div>
-            <video src="${urlCorte}" controls preload="metadata" class="video-result-player" playsinline></video>
+            <video src="${urlCorteHtml}" controls preload="metadata" class="video-result-player" playsinline></video>
             <div class="resultado-meta-grid">
                 <span>Início: <b>${escaparHtml(corte.inicio || '—')}</b></span>
                 <span>Fim: <b>${escaparHtml(corte.fim || '—')}</b></span>
@@ -546,7 +562,7 @@ function renderCorteResultado(corte, idx) {
             <p class="resultado-motivo">${escaparHtml(corte.motivo || 'Trecho viral identificado.')}</p>
             <div class="result-btns">
                 <button type="button" class="btn-assistir btn-play-inline">Assistir</button>
-                <button type="button" class="btn-download btn-download-video" data-url="${urlCorte}">Baixar MP4</button>
+                <button type="button" class="btn-download btn-download-video" data-url="${urlCorteHtml}">Baixar MP4</button>
             </div>
         </article>
     `;
@@ -632,19 +648,20 @@ function renderConteudos(cortes) {
         const titulo = escaparHtml(corte.titulo || 'Sem título');
         const dataFmt = formatarDataPtBR(corte.criado_em);
         const urlVideo = montarUrlVideo(corte.video_url);
+        const urlVideoHtml = escaparHtml(urlVideo);
         const corteId = escaparHtml(corte.id || '');
         const foco = escaparHtml(corte.foco || 'Livre');
         const duracaoTipo = escaparHtml(duracaoLabel(corte.duracao_tipo));
         return `
             <article class="tool-bentoCard conteudo-card" data-corte-id="${corteId}">
                 <label class="conteudo-select-wrap"><input type="checkbox" class="conteudo-select" data-corte-id="${corteId}"> Selecionar</label>
-                <video src="${urlVideo}" controls preload="metadata" class="conteudo-video"></video>
+                <video src="${urlVideoHtml}" controls preload="metadata" class="conteudo-video"></video>
                 <h3 class="tool-title conteudo-title">${titulo}</h3>
                 <p class="tool-description conteudo-date">Criado em: ${dataFmt}</p>
                 <p class="conteudo-tags">Foco: <b>${foco}</b> · Duração: <b>${duracaoTipo}</b></p>
                 <div class="result-btns">
-                    <a href="${urlVideo}" target="_blank" rel="noopener noreferrer" class="btn-assistir">Abrir vídeo</a>
-                    <button type="button" class="btn-download btn-download-video" data-url="${urlVideo}">Baixar</button>
+                    <a href="${urlVideoHtml}" target="_blank" rel="noopener noreferrer" class="btn-assistir">Abrir vídeo</a>
+                    <button type="button" class="btn-download btn-download-video" data-url="${urlVideoHtml}">Baixar</button>
                     <button type="button" class="btn-excluir-corte" data-corte-id="${corteId}">Excluir</button>
                 </div>
             </article>

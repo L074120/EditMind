@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional, Any
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 
 import httpx
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends, Header, Form
@@ -78,7 +78,7 @@ OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 EXTS_VALIDAS = {".mp4", ".mov", ".avi", ".webm"}
-DOMINIOS_SUPORTADOS = {"youtube.com", "www.youtube.com", "youtu.be", "tiktok.com", "www.tiktok.com", "vm.tiktok.com"}
+DOMINIOS_SUPORTADOS = {"youtube.com", "youtu.be", "tiktok.com"}
 
 YT_DLP_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -311,7 +311,10 @@ class YouTubeRequest(BaseModel):
     @classmethod
     def url_yt(cls, v: str) -> str:
         v = v.strip()
-        if "youtube.com" not in v and "youtu.be" not in v:
+        parsed = urlparse(v)
+        if parsed.scheme.lower() not in {"http", "https"} or not dominio_pertence_a(
+            parsed.hostname or "", {"youtube.com", "youtu.be"}
+        ):
             raise ValueError("URL deve ser do YouTube.")
         return v
 
@@ -322,20 +325,23 @@ class YouTubeRequest(BaseModel):
 
 def dominio_url(url: str) -> str:
     parsed = urlparse(url)
-    host = (parsed.netloc or "").lower().replace("www.", "www.")
-    return host
+    return (parsed.hostname or "").lower().rstrip(".")
+
+
+def dominio_pertence_a(host: str, dominios: set[str]) -> bool:
+    host = (host or "").lower().rstrip(".")
+    return any(host == dominio or host.endswith(f".{dominio}") for dominio in dominios)
 
 
 def validar_url_midia(url: str) -> None:
     parsed = urlparse(url)
-    host = (parsed.netloc or "").lower()
-    if not parsed.scheme.startswith("http") or host not in DOMINIOS_SUPORTADOS:
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme.lower() not in {"http", "https"} or not dominio_pertence_a(host, DOMINIOS_SUPORTADOS):
         raise ValueError("URL suportada apenas para YouTube ou TikTok.")
 
 
 def eh_tiktok_url(url: str) -> bool:
-    host = (urlparse(url).netloc or "").lower()
-    return "tiktok.com" in host
+    return dominio_pertence_a(dominio_url(url), {"tiktok.com"})
 
 
 async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
@@ -831,17 +837,40 @@ def _extrair_objeto_storage(video_url: str) -> Optional[str]:
     if not video_url:
         return None
 
-    padroes = ("/storage/v1/object/public/cortes/", "/storage/v1/object/cortes/")
-    for padrao in padroes:
-        if padrao in video_url:
-            return unquote(video_url.split(padrao, 1)[1]).lstrip("/")
+    valor = video_url.strip()
+    parsed = urlparse(valor)
+    if parsed.scheme or parsed.netloc:
+        host_supabase = dominio_url(SUPABASE_URL)
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not host_supabase
+            or dominio_url(valor) != host_supabase
+        ):
+            return None
+        caminho = parsed.path
+    else:
+        caminho = valor.split("?", 1)[0]
 
-    parsed = urlparse(video_url)
-    if parsed.path.startswith("/storage/v1/object/public/cortes/"):
-        return unquote(parsed.path.replace("/storage/v1/object/public/cortes/", "", 1)).lstrip("/")
-    if parsed.path.startswith("/storage/v1/object/cortes/"):
-        return unquote(parsed.path.replace("/storage/v1/object/cortes/", "", 1)).lstrip("/")
+    padroes = (
+        f"/storage/v1/object/public/{STORAGE_BUCKET}/",
+        f"/storage/v1/object/{STORAGE_BUCKET}/",
+    )
+    for padrao in padroes:
+        if caminho.startswith(padrao):
+            objeto = unquote(caminho.removeprefix(padrao)).lstrip("/")
+            partes = objeto.split("/")
+            if objeto and not any(parte in {"", ".", ".."} for parte in partes):
+                return objeto
+            return None
     return None
+
+
+def _url_publica_storage_confiavel(video_url: str) -> Optional[str]:
+    objeto = _extrair_objeto_storage(video_url)
+    if not objeto or not SUPABASE_URL:
+        return None
+    objeto_codificado = quote(objeto, safe="/")
+    return f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/{STORAGE_BUCKET}/{objeto_codificado}"
 
 
 def _normalizar_video_url(video_url: str) -> str:
@@ -859,6 +888,17 @@ def _normalizar_video_url(video_url: str) -> str:
     return valor
 
 
+def _resolver_arquivo_output(video_url: str) -> Optional[Path]:
+    valor = _normalizar_video_url(video_url)
+    if not valor.startswith("/outputs/"):
+        return None
+    arquivo = Path(valor.removeprefix("/")).resolve()
+    base_outputs = OUTPUT_DIR.resolve()
+    if base_outputs not in arquivo.parents or not arquivo.is_file():
+        return None
+    return arquivo
+
+
 async def _remover_arquivo_corte(video_url: str) -> None:
     if not video_url:
         return
@@ -871,12 +911,10 @@ async def _remover_arquivo_corte(video_url: str) -> None:
         await asyncio.to_thread(lambda: supabase_admin.storage.from_(STORAGE_BUCKET).remove([objeto_storage]))
         return
 
-    if video_url.startswith("/outputs/"):
-        arquivo_local = Path(video_url.removeprefix("/")).resolve()
-        base_outputs = OUTPUT_DIR.resolve()
-        if base_outputs in arquivo_local.parents and arquivo_local.exists():
-            logger.info(f"DELETE corte | removendo arquivo local: {arquivo_local}")
-            arquivo_local.unlink(missing_ok=True)
+    arquivo_local = _resolver_arquivo_output(video_url)
+    if arquivo_local:
+        logger.info(f"DELETE corte | removendo arquivo local: {arquivo_local}")
+        arquivo_local.unlink(missing_ok=True)
         return
 
 
@@ -1171,8 +1209,8 @@ async def processar_video(
         raise
     except Exception as e:
         shutil.rmtree(pasta_temp, ignore_errors=True)
-        logger.error(f"Job {job_id} | erro: {e}")
-        raise HTTPException(500, str(e))
+        logger.exception(f"Job {job_id} | erro no processamento: {e}")
+        raise HTTPException(500, "Não foi possível processar o vídeo. Tente novamente em instantes.")
 
 
 @app.post("/api/processar-link")
@@ -1197,8 +1235,8 @@ async def processar_link(tasks: BackgroundTasks, dados: LinkRequest, usuario: di
         raise
     except Exception as e:
         shutil.rmtree(pasta_temp, ignore_errors=True)
-        logger.error(f"Link Job {job_id} | erro: {e}")
-        raise HTTPException(500, str(e))
+        logger.exception(f"Link Job {job_id} | erro no processamento: {e}")
+        raise HTTPException(500, "Não foi possível processar o link. Verifique a URL e tente novamente.")
 
 
 @app.post("/api/processar-youtube")
@@ -1240,8 +1278,8 @@ async def download_link(tasks: BackgroundTasks, dados: LinkRequest, usuario: dic
         raise
     except Exception as e:
         shutil.rmtree(pasta_temp, ignore_errors=True)
-        logger.error(f"DL Job {job_id} | erro: {e}")
-        raise HTTPException(500, str(e))
+        logger.exception(f"DL Job {job_id} | erro no download: {e}")
+        raise HTTPException(500, "Não foi possível baixar o vídeo. Tente novamente em instantes.")
 
 
 @app.post("/api/download-youtube")
@@ -1291,14 +1329,19 @@ async def download_corte(video_url: str, usuario: dict = Depends(get_current_use
             lambda: supabase_admin.table("cortes").select("video_url").eq("user_email", user_email).execute()
         )
         alvo = _normalizar_video_url(video_url)
-        urls_usuario = {_normalizar_video_url(c.get("video_url", "")) for c in (registros.data or [])}
-        if alvo not in urls_usuario:
+        registro = next(
+            (
+                corte for corte in (registros.data or [])
+                if _normalizar_video_url(corte.get("video_url", "")) == alvo
+            ),
+            None,
+        )
+        if not registro:
             raise HTTPException(404, "Vídeo não encontrado para o usuário autenticado.")
 
         if alvo.startswith("/outputs/"):
-            caminho = Path(alvo.removeprefix("/")).resolve()
-            base_outputs = OUTPUT_DIR.resolve()
-            if base_outputs not in caminho.parents or not caminho.exists():
+            caminho = _resolver_arquivo_output(alvo)
+            if not caminho:
                 raise HTTPException(404, "Arquivo local não encontrado.")
 
             def iter_local():
@@ -1308,8 +1351,12 @@ async def download_corte(video_url: str, usuario: dict = Depends(get_current_use
 
             return StreamingResponse(iter_local(), media_type="video/mp4", headers={"Content-Disposition": 'attachment; filename="Corte_EditMind.mp4"'})
 
+        url_remota = _url_publica_storage_confiavel(registro.get("video_url", ""))
+        if not url_remota:
+            raise HTTPException(400, "URL de recorte não permitida.")
+
         async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
-            resp = await client.get(video_url.strip())
+            resp = await client.get(url_remota)
             if resp.status_code >= 400:
                 raise HTTPException(502, "Falha ao obter arquivo remoto para download.")
             content_type = resp.headers.get("content-type", "video/mp4")
@@ -1417,15 +1464,18 @@ async def baixar_cortes_em_massa(dados: BulkDeleteRequest, usuario: dict = Depen
                 nome_base = sanitizar(corte.get("titulo") or f"recorte_{i}").removesuffix(".mp4")
                 nome_zip = f"{nome_base}_{i}.mp4"
                 url = corte.get("video_url", "")
-                if url.startswith("/outputs/"):
-                    arquivo = Path(url.removeprefix("/")).resolve()
-                    if arquivo.exists():
-                        zipf.write(arquivo, arcname=nome_zip)
+                arquivo = _resolver_arquivo_output(url)
+                if arquivo:
+                    zipf.write(arquivo, arcname=nome_zip)
                     continue
-                if url:
-                    destino = pasta_temp / f"tmp_{i}.mp4"
-                    await _baixar_para_arquivo(url, destino)
-                    zipf.write(destino, arcname=nome_zip)
+
+                url_remota = _url_publica_storage_confiavel(url)
+                if not url_remota:
+                    raise HTTPException(400, f"URL inválida no recorte {corte.get('id') or i}.")
+
+                destino = pasta_temp / f"tmp_{i}.mp4"
+                await _baixar_para_arquivo(url_remota, destino)
+                zipf.write(destino, arcname=nome_zip)
 
         file_size = zip_path.stat().st_size
 
